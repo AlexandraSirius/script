@@ -1,0 +1,213 @@
+КРАТКАЯ ИНСТРУКЦИЯ БЕЗ ПЕРЕМЕННЫХ
+Минимально поднять IP + SSH, чтобы мастер-скрипт смог работать.
+
+Пароли:
+- VESR первый пароль admin: Admin1234
+- net_admin: P@ssw0rd
+- root на Linux-машинах: задаёшь сама через passwd root
+
+Схема:
+- HQ-RTR gi1/0/2 = ISP-HQ
+- HQ-RTR gi1/0/3 = HQ-SRV-Net
+- HQ-RTR gi1/0/4 = HQ-CLI-Net
+- BR-RTR gi1/0/2 = BR-Net
+- BR-RTR gi1/0/3 = ISP-BR
+- Linux-интерфейс на HQ-SRV/BR-SRV/HQ-CLI = enp7s1
+
+
+============================================================
+1. HQ-RTR
+============================================================
+
+В консоль HQ-RTR вставить:
+
+password Admin1234
+commit
+confirm
+configure terminal
+hostname hq-rtr.sirius-exam.org
+username net_admin
+ password P@ssw0rd
+ privilege 15
+exit
+
+interface gigabitethernet 1/0/2
+ ip firewall disable
+ ip address 172.16.1.2/28
+exit
+
+interface gigabitethernet 1/0/3
+ ip firewall disable
+ ip address 192.168.100.1/27
+exit
+
+interface gigabitethernet 1/0/4
+ ip firewall disable
+ ip address 192.168.200.1/28
+exit
+
+ip route 0.0.0.0/0 172.16.1.1
+ip ssh server
+do commit
+do confirm
+
+Проверка на HQ-RTR:
+
+show ip interfaces gigabitethernet 1/0/2
+show ip interfaces gigabitethernet 1/0/3
+show ip interfaces gigabitethernet 1/0/4
+
+Должно быть:
+172.16.1.2/28
+192.168.100.1/27
+192.168.200.1/28
+
+
+============================================================
+2. BR-RTR
+============================================================
+
+В консоль BR-RTR вставить:
+
+password Admin1234
+commit
+confirm
+configure terminal
+hostname br-rtr.sirius-exam.org
+username net_admin
+ password P@ssw0rd
+ privilege 15
+exit
+
+interface gigabitethernet 1/0/2
+ ip firewall disable
+ ip address 192.168.30.1/28
+exit
+
+interface gigabitethernet 1/0/3
+ ip firewall disable
+ ip address 172.16.2.2/28
+exit
+
+ip route 0.0.0.0/0 172.16.2.1
+ip ssh server
+do commit
+do confirm
+
+Проверка на BR-RTR:
+
+show ip interfaces gigabitethernet 1/0/2
+show ip interfaces gigabitethernet 1/0/3
+
+Должно быть:
+192.168.30.1/28
+172.16.2.2/28
+
+
+============================================================
+3. HQ-SRV
+============================================================
+
+В консоль HQ-SRV вставить:
+
+nmcli con add type ethernet ifname enp7s1 con-name HQ-SRV ipv4.addresses 192.168.100.2/27 ipv4.gateway 192.168.100.1 ipv4.method manual 2>/dev/null || true
+nmcli con mod HQ-SRV ipv4.addresses 192.168.100.2/27 ipv4.gateway 192.168.100.1 ipv4.method manual
+nmcli con up HQ-SRV
+
+passwd root
+
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+
+ssh-keygen -A
+sshd -t
+systemctl enable --now sshd
+systemctl restart sshd
+
+ip -br a
+ip route
+ping -c 3 192.168.100.1
+
+
+============================================================
+4. BR-SRV
+============================================================
+
+В консоль BR-SRV вставить:
+
+nmcli con add type ethernet ifname enp7s1 con-name BR-SRV ipv4.addresses 192.168.30.2/28 ipv4.gateway 192.168.30.1 ipv4.method manual 2>/dev/null || true
+nmcli con mod BR-SRV ipv4.addresses 192.168.30.2/28 ipv4.gateway 192.168.30.1 ipv4.method manual
+nmcli con up BR-SRV
+
+passwd root
+
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+
+ssh-keygen -A
+sshd -t
+systemctl enable --now sshd
+systemctl restart sshd
+
+ip -br a
+ip route
+ping -c 3 192.168.30.1
+
+
+============================================================
+5. HQ-CLI
+============================================================
+
+В консоль HQ-CLI вставить:
+
+nmcli con add type ethernet ifname enp7s1 con-name HQ-CLI ipv4.addresses 192.168.200.3/28 ipv4.gateway 192.168.200.1 ipv4.method manual 2>/dev/null || true
+nmcli con mod HQ-CLI ipv4.addresses 192.168.200.3/28 ipv4.gateway 192.168.200.1 ipv4.method manual
+nmcli con up HQ-CLI
+
+passwd root
+
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+
+ssh-keygen -A
+sshd -t
+systemctl enable --now sshd
+systemctl restart sshd
+
+ip -br a
+ip route
+ping -c 3 192.168.200.1
+
+
+============================================================
+6. Проверка с ISP
+============================================================
+
+На ISP выполнить:
+
+ping -c 3 172.16.1.2
+ping -c 3 172.16.2.2
+ping -c 3 192.168.100.2
+ping -c 3 192.168.30.2
+ping -c 3 192.168.200.3
+
+ssh net_admin@172.16.1.2
+ssh net_admin@172.16.2.2
+ssh root@192.168.100.2
+ssh root@192.168.30.2
+ssh root@192.168.200.3
+
+
+============================================================
+7. Запуск мастер-скрипта
+============================================================
+
+С хоста KVM:
+
+scp '/home/reduser/Загрузки/demoexam_central_master_interactive_ports_v7_skip_mgmt.sh' root@10.23.68.161:/root/ && \
+ssh -tt root@10.23.68.161 'cd /root && chmod +x demoexam_central_master_interactive_ports_v7_skip_mgmt.sh && bash demoexam_central_master_interactive_ports_v7_skip_mgmt.sh'
+
+При вопросе HQ-MGMT выбрать skip/Enter.
