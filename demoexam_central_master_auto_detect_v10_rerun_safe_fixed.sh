@@ -1,0 +1,2269 @@
+#!/bin/bash
+# demoexam_central_master_step.sh
+# Центральный пошаговый мастер-скрипт.
+# Запускать на ISP под root:
+#   bash demoexam_central_master_step.sh
+#
+# Логика:
+# - ISP настраивается автоматически.
+# - HQ-RTR/BR-RTR: компактная подсказка bootstrap через консоль, затем настройка по SSH.
+# - Linux-машины: сначала проверка стандартного IP/SSH; если не доступно — короткая подсказка.
+# - Если шаг упал, дальше НЕ идём, пока не исправишь.
+# - Вывод минимальный: [OK]/[FAIL]/[WAIT].
+# - Ошибки: /tmp/demoexam_*.err
+# - Статус: /root/demoexam_status.txt
+
+set -uo pipefail
+
+DOMAIN="sirius-exam.org"
+PASS="P@ssw0rd"
+VESR_FIRST_PASS="Admin1234"
+STATUS_FILE="/root/demoexam_status.txt"
+: > "$STATUS_FILE"
+
+# Proxmox bridge labels. Можно переопределить переменными окружения перед запуском.
+WAN_BRIDGE="${WAN_BRIDGE:-vmbr0}"
+ISP_HQ_BRIDGE="${ISP_HQ_BRIDGE:-vmbr1041}"
+ISP_BR_BRIDGE="${ISP_BR_BRIDGE:-vmbr1042}"
+HQ_SRV_BRIDGE="${HQ_SRV_BRIDGE:-vmbr1043}"
+HQ_CLI_BRIDGE="${HQ_CLI_BRIDGE:-vmbr1044}"
+BR_LAN_BRIDGE="${BR_LAN_BRIDGE:-vmbr1045}"
+
+
+ROOT_SSH_USER="${ROOT_SSH_USER:-root}"
+ROOT_SSH_PASS="${ROOT_SSH_PASS:-}"
+
+# Интерактивная карта портов/интерфейсов. Можно заранее задать через переменные окружения.
+HQR_ISP_PORT="${HQR_ISP_PORT:-gigabitethernet 1/0/2}"
+HQR_SRV_PORT="${HQR_SRV_PORT:-gigabitethernet 1/0/3}"
+HQR_CLI_PORT="${HQR_CLI_PORT:-gigabitethernet 1/0/4}"
+BRR_LAN_PORT="${BRR_LAN_PORT:-gigabitethernet 1/0/2}"
+BRR_ISP_PORT="${BRR_ISP_PORT:-gigabitethernet 1/0/3}"
+HQ_SRV_IF="${HQ_SRV_IF:-enp7s1}"
+BR_SRV_IF="${BR_SRV_IF:-enp7s1}"
+HQ_CLI_IF="${HQ_CLI_IF:-enp7s1}"
+
+say(){ echo "$1"; }
+ok(){ echo "[OK] $1"; echo "OK $1" >> "$STATUS_FILE"; }
+fail(){ echo "[FAIL] $1"; echo "FAIL $1" >> "$STATUS_FILE"; }
+info(){ echo "[INFO] $1"; }
+wait_enter(){ echo; read -rp "[ENTER] Нажми Enter, когда сделал(а) действие выше: " _; }
+
+need_root(){
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Запусти от root на ISP."
+    exit 1
+  fi
+}
+
+run_until_ok(){
+  local title="$1"
+  local cmd="$2"
+  local n=1
+  while true; do
+    say ""
+    say "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    say "$title"
+    say "попытка $n"
+    say "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if eval "$cmd"; then
+      return 0
+    fi
+    say ""
+    say "[WAIT] Шаг не завершён. Исправь причину и нажми Enter — повторю этот же шаг."
+    wait_enter
+    n=$((n+1))
+  done
+}
+
+
+normalize_vesr_port(){
+  local x="$1"
+  x="${x//[$'\t\r\n ']}"
+  if [[ "$x" =~ ^[0-9]+$ ]]; then
+    echo "gigabitethernet 1/0/$x"
+  elif [[ "$x" =~ ^gi([0-9]+)$ ]]; then
+    echo "gigabitethernet 1/0/${BASH_REMATCH[1]}"
+  elif [[ "$x" =~ ^1/0/([0-9]+)$ ]]; then
+    echo "gigabitethernet 1/0/${BASH_REMATCH[1]}"
+  elif [[ "$x" =~ ^gigabitethernet ]]; then
+    echo "$x"
+  else
+    echo "$x"
+  fi
+}
+
+ask_port_num(){
+  local prompt="$1"
+  local def_num="$2"
+  local ans
+  read -rp "$prompt [$def_num]: " ans
+  ans="${ans:-$def_num}"
+  normalize_vesr_port "$ans"
+}
+
+print_bridge_map_hint(){
+  cat <<EOF
+
+Как понять порт Eltex:
+1. В Proxmox открой ВМ → Оборудование.
+2. У каждого "Сетевое устройство" смотри:
+   bridge/vmbr и MAC-адрес.
+3. На Eltex выполни:
+   show interfaces status
+4. Сравни MAC из Proxmox с MAC в Eltex.
+5. В скрипт вводи ТОЛЬКО последнюю цифру порта:
+   2 = gigabitethernet 1/0/2
+   3 = gigabitethernet 1/0/3
+
+Карта мостов Proxmox для этого стенда:
+  $WAN_BRIDGE    = WAN / Интернет
+  $ISP_HQ_BRIDGE = ISP-HQ
+  $ISP_BR_BRIDGE = ISP-BR
+  $HQ_SRV_BRIDGE = HQ-SRV-Net
+  $HQ_CLI_BRIDGE = HQ-CLI-Net
+  $BR_LAN_BRIDGE = BR-Net / BR-LAN
+
+Что это значит:
+  HQ-RTR порт с bridge $ISP_HQ_BRIDGE = порт к ISP-HQ
+  HQ-RTR порт с bridge $HQ_SRV_BRIDGE = порт к HQ-SRV
+  HQ-RTR порт с bridge $HQ_CLI_BRIDGE = порт к HQ-CLI
+
+  BR-RTR порт с bridge $BR_LAN_BRIDGE = порт к BR-Net / BR-LAN
+  BR-RTR порт с bridge $ISP_BR_BRIDGE = порт к ISP-BR
+
+EOF
+}
+
+ask_default(){
+  local prompt="$1"
+  local def="$2"
+  local ans
+  read -rp "$prompt [$def]: " ans
+  echo "${ans:-$def}"
+}
+
+ask_set(){
+  local varname="$1"
+  local prompt="$2"
+  local def="$3"
+  local ans=""
+  printf "\n%s\n" "$prompt"
+  printf "Enter = оставить [%s]\n> " "$def"
+  read -r ans
+  ans="${ans:-$def}"
+  printf -v "$varname" '%s' "$ans"
+}
+
+ask_port_set(){
+  local varname="$1"
+  local prompt="$2"
+  local def_num="$3"
+  local ans=""
+  printf "\n%s\n" "$prompt"
+  printf "Введи только цифру порта. Например: 2 = gigabitethernet 1/0/2\n"
+  printf "Enter = оставить [%s]\n> " "$def_num"
+  read -r ans
+  ans="${ans:-$def_num}"
+  ans="$(normalize_vesr_port "$ans")"
+  printf -v "$varname" '%s' "$ans"
+}
+
+ask_optional_port_set(){
+  local varname="$1"
+  local prompt="$2"
+  local def_num="$3"
+  local ans=""
+  printf "\n%s\n" "$prompt"
+  printf "Введи только цифру порта. Например: 2 = gigabitethernet 1/0/2\n"
+  printf "Если такого адаптера НЕТ — введи 0 или skip.\n"
+  printf "Enter = [%s]\n> " "$def_num"
+  read -r ans
+  ans="${ans:-$def_num}"
+  if [[ "$ans" =~ ^(0|none|NONE|skip|SKIP|-)$ ]]; then
+    ans: # HQ-MGMT removed
+  else
+    ans="$(normalize_vesr_port "$ans")"
+  fi
+  printf -v "$varname" '%s' "$ans"
+}
+
+
+
+get_root_ssh_pass_once(){
+  if [ -z "$ROOT_SSH_PASS" ]; then
+    read -rsp "Пароль root для Linux-машин: " ROOT_SSH_PASS
+    echo
+  fi
+}
+
+ask_root_ssh_pass_force(){
+  read -rsp "Пароль root ещё раз: " ROOT_SSH_PASS
+  echo
+}
+
+
+ask_value(){
+  local var="$1" prompt="$2" def="$3" ans=""
+  read -rp "$prompt [$def]: " ans
+  printf -v "$var" '%s' "${ans:-$def}"
+}
+
+print_mapping_help(){
+  cat <<'EOF'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+КАК ОПРЕДЕЛИТЬ ПОРТЫ И АДАПТЕРЫ
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1) ISP Linux:
+   На ISP смотри:
+     ip -br a
+     nmcli device status
+   WAN — интерфейс с внешним адресом, например 10.23.x.x.
+   Два остальных интерфейса — линии к HQ-RTR и BR-RTR.
+
+2) Eltex / vESR:
+   На Eltex смотри MAC портов:
+     show interfaces status
+   В Proxmox/на KVM смотри MAC сетевых устройств:
+     virsh domiflist HQ-RTR
+     virsh domiflist BR-RTR
+   Совпавший MAC показывает, какой gi1/0/X подключён к какой сети.
+
+   Для HQ-RTR нужно узнать:
+     порт к ISP-HQ
+     порт к HQ-SRV
+     порт к HQ-CLI
+     порт к HQ-MGMT
+
+   Для BR-RTR нужно узнать:
+     порт к BR-LAN
+     порт к ISP-BR
+
+3) Linux-серверы:
+   На каждой машине смотри:
+     ip -br a
+   Обычно интерфейс ens3 или enp7s1.
+
+EOF
+}
+
+ask_topology(){
+  say ""
+  say "============================================================"
+  say "КАРТА СЕТЕЙ И ПОРТОВ"
+  say "============================================================"
+  say "Скрипт сейчас спросит, какая сеть куда подключена."
+  say "Если у тебя как на скрине Proxmox, почти везде можно нажимать Enter."
+  say ""
+  say "Твоя типовая карта Proxmox:"
+  say "  vmbr0    = WAN / Интернет"
+  say "  vmbr1041 = ISP-HQ"
+  say "  vmbr1042 = ISP-BR"
+  say "  vmbr1043 = HQ-SRV-Net"
+  say "  vmbr1044 = HQ-CLI-Net"
+  say "  vmbr1045 = BR-Net"
+  say ""
+
+  ask_set WAN_BRIDGE "1/6. Bridge WAN / Интернет" "$WAN_BRIDGE"
+  ask_set ISP_HQ_BRIDGE "2/6. Bridge ISP-HQ, сеть между ISP и HQ-RTR" "$ISP_HQ_BRIDGE"
+  ask_set ISP_BR_BRIDGE "3/6. Bridge ISP-BR, сеть между ISP и BR-RTR" "$ISP_BR_BRIDGE"
+  ask_set HQ_SRV_BRIDGE "4/6. Bridge HQ-SRV-Net, сеть между HQ-RTR и HQ-SRV" "$HQ_SRV_BRIDGE"
+  ask_set HQ_CLI_BRIDGE "5/6. Bridge HQ-CLI-Net, сеть между HQ-RTR и HQ-CLI" "$HQ_CLI_BRIDGE"
+  ask_set BR_LAN_BRIDGE "6/6. Bridge BR-Net, сеть между BR-RTR и BR-SRV" "$BR_LAN_BRIDGE"
+
+  say ""
+  say "============================================================"
+  say "ИНТЕРФЕЙСЫ ISP"
+  say "============================================================"
+  say "Это имена внутри Linux ISP: enp7s1, enp7s2, enp7s3."
+  say "Как проверить на ISP:"
+  say "  ip -br a"
+  say ""
+  say "Обычно:"
+  say "  enp7s1 = $WAN_BRIDGE / WAN"
+  say "  enp7s2 = $ISP_HQ_BRIDGE / ISP-HQ"
+  say "  enp7s3 = $ISP_BR_BRIDGE / ISP-BR"
+  say ""
+
+  ask_set WAN_IF "ISP: интерфейс WAN / $WAN_BRIDGE" "${WAN_IF:-enp7s1}"
+  ask_set HQ_IF "ISP: интерфейс к HQ-RTR / $ISP_HQ_BRIDGE" "${HQ_IF:-enp7s2}"
+  ask_set BR_IF "ISP: интерфейс к BR-RTR / $ISP_BR_BRIDGE" "${BR_IF:-enp7s3}"
+
+  say ""
+  say "============================================================"
+  say "ПОРТЫ HQ-RTR"
+  say "============================================================"
+  say "Это порты внутри Eltex: gigabitethernet 1/0/X."
+  say "Вводить нужно только последнюю цифру X."
+  say ""
+  say "Как узнать:"
+  say "  1) В Proxmox открой HQ-RTR → Оборудование."
+  say "  2) Найди сетевое устройство с нужным bridge, например $HQ_SRV_BRIDGE."
+  say "  3) Запомни его MAC."
+  say "  4) В консоли HQ-RTR выполни:"
+  say "       show interfaces status"
+  say "  5) Найди такой же MAC и посмотри gi1/0/X."
+  say ""
+  say "Если порядок как на твоём скрине:"
+  say "  net6 / $ISP_HQ_BRIDGE = порт 2"
+  say "  net7 / $HQ_SRV_BRIDGE = порт 3"
+  say "  net8 / $HQ_CLI_BRIDGE = порт 4
+  отдельного HQ-MGMT адаптера на твоём скрине нет → для HQ-MGMT вводи 0 или просто Enter"
+  say ""
+
+  ask_port_set HQ_RTR_ISP_PORT "HQ-RTR: порт к ISP-HQ / $ISP_HQ_BRIDGE" "${HQ_RTR_ISP_NUM:-2}"
+  ask_port_set HQ_RTR_SRV_PORT "HQ-RTR: порт к HQ-SRV-Net / $HQ_SRV_BRIDGE" "${HQ_RTR_SRV_NUM:-3}"
+  ask_port_set HQ_RTR_CLI_PORT "HQ-RTR: порт к HQ-CLI-Net / $HQ_CLI_BRIDGE" "${HQ_RTR_CLI_NUM:-4}"
+  ask_optional_port_set "HQ-RTR: порт к HQ-MGMT. В твоём Proxmox отдельного HQ-MGMT адаптера нет, поэтому жми Enter/0/skip" "${HQ_RTR_MGMT_NUM:-skip}"
+
+  say ""
+  say "============================================================"
+  say "ПОРТЫ BR-RTR"
+  say "============================================================"
+  say "BR-Net и BR-LAN — это одно и то же для нашего стенда."
+  say "BR-Net = $BR_LAN_BRIDGE."
+  say ""
+  say "Как узнать порт:"
+  say "  Proxmox BR-RTR → Оборудование → смотри bridge и MAC."
+  say "  Eltex BR-RTR → show interfaces status → ищи такой же MAC."
+  say ""
+  say "Обычно:"
+  say "  $BR_LAN_BRIDGE / BR-Net = порт 2"
+  say "  $ISP_BR_BRIDGE / ISP-BR = порт 3"
+  say ""
+
+  ask_port_set BR_RTR_LAN_PORT "BR-RTR: порт к BR-Net / BR-LAN / $BR_LAN_BRIDGE" "${BR_RTR_LAN_NUM:-2}"
+  ask_port_set BR_RTR_ISP_PORT "BR-RTR: порт к ISP-BR / $ISP_BR_BRIDGE" "${BR_RTR_ISP_NUM:-3}"
+
+  say ""
+  say "============================================================"
+  say "LINUX-ИНТЕРФЕЙСЫ НА HQ-SRV / BR-SRV / HQ-CLI"
+  say "============================================================"
+  say "Это имя сетевой карты внутри Linux-машины."
+  say "Как проверить на каждой машине:"
+  say "  ip -br a"
+  say "На твоих новых образах часто это enp7s1."
+  say ""
+
+  ask_set HQ_SRV_IF "HQ-SRV: интерфейс в $HQ_SRV_BRIDGE / HQ-SRV-Net" "${HQ_SRV_IF:-enp7s1}"
+  ask_set BR_SRV_IF "BR-SRV: интерфейс в $BR_LAN_BRIDGE / BR-Net" "${BR_SRV_IF:-enp7s1}"
+  ask_set HQ_CLI_IF "HQ-CLI: интерфейс в $HQ_CLI_BRIDGE / HQ-CLI-Net" "${HQ_CLI_IF:-enp7s1}"
+
+  say ""
+  say "============================================================"
+  say "ИТОГОВАЯ КАРТА"
+  say "============================================================"
+  say "  $WAN_BRIDGE    WAN          -> ISP $WAN_IF"
+  say "  $ISP_HQ_BRIDGE ISP-HQ       -> ISP $HQ_IF, HQ-RTR $HQ_RTR_ISP_PORT"
+  say "  $ISP_BR_BRIDGE ISP-BR       -> ISP $BR_IF, BR-RTR $BR_RTR_ISP_PORT"
+  say "  $HQ_SRV_BRIDGE HQ-SRV-Net   -> HQ-RTR $HQ_RTR_SRV_PORT, HQ-SRV $HQ_SRV_IF"
+  say "  $HQ_CLI_BRIDGE HQ-CLI-Net   -> HQ-RTR $HQ_RTR_CLI_PORT, HQ-CLI $HQ_CLI_IF"
+  say "  $BR_LAN_BRIDGE BR-Net       -> BR-RTR $BR_RTR_LAN_PORT, BR-SRV $BR_SRV_IF"
+  say "  HQ-MGMT                  -> HQ-RTR $HQ_RTR_MGMT_PORT"
+  say ""
+  say "Если всё похоже на твою схему — напиши yes или просто нажми Enter."
+  read -rp "Продолжить? yes/no [yes]: " okmap
+  okmap="${okmap:-yes}"
+  [ "$okmap" = "yes" ] || return 1
+}
+
+
+install_tools(){
+  local miss=""
+  command -v expect >/dev/null 2>&1 || miss="$miss expect"
+  command -v sshpass >/dev/null 2>&1 || miss="$miss sshpass"
+  command -v ssh >/dev/null 2>&1 || miss="$miss openssh-clients"
+  if [ -n "$miss" ]; then
+    fail "на ISP нет нужных утилит:$miss. Ничего не устанавливаю."
+    echo "Поставь заранее с ISO/репозитория или используй старую версию скрипта с dnf."
+    return 1
+  fi
+  ok "ISP tools: expect/sshpass/ssh уже есть"
+}
+
+check_ping(){ ping -c 2 -W 2 "$1" >/dev/null 2>&1; }
+
+show_tail_err(){
+  local f="$1"
+  [ -f "$f" ] && { echo "----- последние строки $f -----"; tail -n 20 "$f"; echo "-------------------------------"; }
+}
+
+check_ssh(){
+  local ip="$1" user="$2" pass="$3"
+  sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 "$user@$ip" "echo ok" >/tmp/demoexam_check_ssh.out 2>/tmp/demoexam_check_ssh.err
+}
+
+ssh_run(){
+  local ip="$1" user="$2" pass="$3" name="$4" payload="$5" err="/tmp/demoexam_${name}.err" out="/tmp/demoexam_${name}_remote.log"
+  rm -f "$out" "$err"
+  echo "[..] $name: удалённое выполнение началось, подробный лог: $out"
+  sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 "$user@$ip" "bash -s" 2>"$err" <<< "$payload" | tee "$out" | sed -u -n 's/^REMOTE_STATUS: //p'
+  local rc=${PIPESTATUS[0]}
+  if [ "$rc" -eq 0 ]; then
+    echo "[OK] $name: удалённое выполнение завершено"
+  else
+    echo "[FAIL] $name: удалённое выполнение завершилось с ошибкой, код $rc"
+  fi
+  return "$rc"
+}
+
+auto_detect_isp_interfaces(){
+  WAN_IF="${WAN_IF:-$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
+  [ -n "$WAN_IF" ] || WAN_IF="$(ip -o -4 addr show scope global | awk '{print $2; exit}')"
+
+  # Если ISP уже настроен, берём интерфейсы по адресам.
+  HQ_IF="${HQ_IF:-$(ip -o -4 addr show | awk '$4 ~ /^172\.16\.1\.1\/28$/ {print $2; exit}')}"
+  BR_IF="${BR_IF:-$(ip -o -4 addr show | awk '$4 ~ /^172\.16\.2\.1\/28$/ {print $2; exit}')}"
+
+  mapfile -t CANDIDATES < <(
+    nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null |
+    awk -F: '$2=="ethernet"{print $1}' |
+    grep -v "^${WAN_IF}$" |
+    sort
+  )
+
+  probe_l2(){
+    local iface="$1" local_ip="$2" peer_ip="$3"
+    ip link set "$iface" up >/dev/null 2>&1 || true
+    ip addr flush dev "$iface" 2>/dev/null || true
+    ip addr add "$local_ip" dev "$iface" 2>/dev/null || true
+    sleep 1
+    ping -c 1 -W 1 "$peer_ip" >/dev/null 2>&1
+  }
+
+  # Если интерфейс HQ неизвестен, ищем тот, на котором отвечает HQ-RTR 172.16.1.2.
+  if [ -z "$HQ_IF" ]; then
+    for cand in "${CANDIDATES[@]}"; do
+      [ "$cand" = "$BR_IF" ] && continue
+      echo "[..] ISP detect: проверяю $cand как ISP-HQ через ping 172.16.1.2"
+      if probe_l2 "$cand" "172.16.1.1/28" "172.16.1.2"; then
+        HQ_IF="$cand"
+        echo "[OK] ISP detect: $HQ_IF = ISP-HQ"
+        break
+      fi
+    done
+  fi
+
+  # Если интерфейс BR неизвестен, ищем тот, на котором отвечает BR-RTR 172.16.2.2.
+  if [ -z "$BR_IF" ]; then
+    for cand in "${CANDIDATES[@]}"; do
+      [ "$cand" = "$HQ_IF" ] && continue
+      echo "[..] ISP detect: проверяю $cand как ISP-BR через ping 172.16.2.2"
+      if probe_l2 "$cand" "172.16.2.1/28" "172.16.2.2"; then
+        BR_IF="$cand"
+        echo "[OK] ISP detect: $BR_IF = ISP-BR"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$WAN_IF" ] || [ -z "$HQ_IF" ] || [ -z "$BR_IF" ]; then
+    fail "не смог определить интерфейсы ISP автоматически"
+    echo "Что проверяет скрипт:"
+    echo "  WAN = интерфейс из default route"
+    echo "  ISP-HQ = интерфейс, где пингуется 172.16.1.2"
+    echo "  ISP-BR = интерфейс, где пингуется 172.16.2.2"
+    echo "Проверь:"
+    echo "  ip -br a"
+    echo "  nmcli device status"
+    echo "  ping -c 3 172.16.1.2"
+    echo "  ping -c 3 172.16.2.2"
+    return 1
+  fi
+}
+
+
+auto_from_bootstrap(){
+  echo
+  echo "============================================================"
+  echo "АВТООПРЕДЕЛЕНИЕ ПО ФАКТУ, БЕЗ СТАНДАРТНОЙ КАРТЫ"
+  echo "============================================================"
+  echo "Скрипт не спрашивает порты и не верит порядку адаптеров."
+  echo "Логика:"
+  echo "  ISP: через nmcli/ip + пробный ping до 172.16.1.2 и 172.16.2.2"
+  echo "  Eltex: через SSH и show running-config; More? и вопрос выхода обрабатываются автоматически"
+  echo "  Linux: если доступен по SSH, интерфейс берётся по IP; если недоступен — будет короткая подсказка."
+  echo
+
+  auto_detect_isp_interfaces || return 1
+
+  # Начальные значения пустые: их должен заполнить show running-config.
+  HQ_RTR_ISP_PORT=""
+  HQ_RTR_SRV_PORT=""
+  HQ_RTR_CLI_PORT=""
+  BR_RTR_ISP_PORT=""
+  BR_RTR_LAN_PORT=""
+
+  detect_router_ports_from_bootstrap || return 1
+
+  HQR_ISP_PORT="$HQ_RTR_ISP_PORT"
+  HQR_SRV_PORT="$HQ_RTR_SRV_PORT"
+  HQR_CLI_PORT="$HQ_RTR_CLI_PORT"
+  BRR_LAN_PORT="$BR_RTR_LAN_PORT"
+  BRR_ISP_PORT="$BR_RTR_ISP_PORT"
+
+  HQ_SRV_IF="${HQ_SRV_IF:-enp7s1}"
+  BR_SRV_IF="${BR_SRV_IF:-enp7s1}"
+  HQ_CLI_IF="${HQ_CLI_IF:-enp7s1}"
+
+  echo "Итог автоопределения:"
+  echo "  ISP: WAN=$WAN_IF, ISP-HQ=$HQ_IF, ISP-BR=$BR_IF"
+  echo "  HQ-RTR: ISP=$HQR_ISP_PORT, HQ-SRV=$HQR_SRV_PORT, HQ-CLI=$HQR_CLI_PORT"
+  echo "  BR-RTR: ISP=$BRR_ISP_PORT, BR-Net=$BRR_LAN_PORT"
+  echo "  Linux fallback IF для подсказок: HQ-SRV=$HQ_SRV_IF, BR-SRV=$BR_SRV_IF, HQ-CLI=$HQ_CLI_IF"
+  echo
+}
+
+
+vesr_running_config_to_file(){
+  local ip="$1"
+  local out="$2"
+  local tmp="/tmp/demoexam_showrun_${ip//./_}.expect"
+
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/expect -f
+set timeout 180
+set ip [lindex $argv 0]
+set user "net_admin"
+set pass "P@ssw0rd"
+log_user 1
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 $user@$ip
+expect {
+    -re "yes/no" { send "yes\r"; exp_continue }
+    -re "(P|p)assword:" { send "$pass\r" }
+    timeout { exit 10 }
+    eof { exit 11 }
+}
+expect {
+    -re {[#>]} {}
+    timeout { exit 12 }
+}
+
+send "terminal datadump\r"
+expect {
+    -re {[#>]} {}
+    timeout {}
+}
+
+send "show running-config\r"
+expect {
+    -re {More\?.*} { send " "; exp_continue }
+    -re {--More--.*} { send " "; exp_continue }
+    -re {[#>]} {}
+    timeout { exit 13 }
+}
+
+send "exit\r"
+expect {
+    -re {Do you still want to log out\?.*} { send "y\r"; exp_continue }
+    eof {}
+    timeout { exit 14 }
+}
+EOF
+
+  chmod +x "$tmp"
+  "$tmp" "$ip" > "$out" 2>&1
+}
+
+port_by_ip_in_run(){
+  local file="$1"
+  local ipcidr="$2"
+  awk -v want="$ipcidr" '
+    /^interface gigabitethernet / {iface=$2" "$3}
+    index($0, "ip address " want) > 0 {print iface; exit}
+  ' "$file"
+}
+
+detect_router_ports_from_bootstrap(){
+  echo "[..] Eltex detect: читаю show running-config и ищу IP на интерфейсах"
+
+  local hqrun="/tmp/demoexam_hq_rtr_showrun.log"
+  if ! check_ping 172.16.1.2; then
+    fail "HQ-RTR 172.16.1.2 не пингуется, невозможно определить порты"
+    return 1
+  fi
+  if ! vesr_running_config_to_file 172.16.1.2 "$hqrun"; then
+    fail "HQ-RTR: не смог прочитать show running-config"
+    echo "Лог: $hqrun"
+    tail -40 "$hqrun" 2>/dev/null || true
+    return 1
+  fi
+
+  HQ_RTR_ISP_PORT="$(port_by_ip_in_run "$hqrun" "172.16.1.2/28" | tr -d '\r' | xargs)"
+  HQ_RTR_SRV_PORT="$(port_by_ip_in_run "$hqrun" "192.168.100.1/27" | tr -d '\r' | xargs)"
+  HQ_RTR_CLI_PORT="$(port_by_ip_in_run "$hqrun" "192.168.200.1/28" | tr -d '\r' | xargs)"
+
+  if [ -z "$HQ_RTR_ISP_PORT" ] || [ -z "$HQ_RTR_SRV_PORT" ] || [ -z "$HQ_RTR_CLI_PORT" ]; then
+    fail "HQ-RTR: не нашёл все нужные IP в show running-config"
+    echo "Нужно, чтобы минималка была применена:"
+    echo "  172.16.1.2/28"
+    echo "  192.168.100.1/27"
+    echo "  192.168.200.1/28"
+    echo "Лог: $hqrun"
+    grep -n "interface gigabitethernet\\|ip address" "$hqrun" | tail -80 || true
+    return 1
+  fi
+
+  local brrun="/tmp/demoexam_br_rtr_showrun.log"
+  if ! check_ping 172.16.2.2; then
+    fail "BR-RTR 172.16.2.2 не пингуется, невозможно определить порты"
+    return 1
+  fi
+  if ! vesr_running_config_to_file 172.16.2.2 "$brrun"; then
+    fail "BR-RTR: не смог прочитать show running-config"
+    echo "Лог: $brrun"
+    tail -40 "$brrun" 2>/dev/null || true
+    return 1
+  fi
+
+  BR_RTR_ISP_PORT="$(port_by_ip_in_run "$brrun" "172.16.2.2/28" | tr -d '\r' | xargs)"
+  BR_RTR_LAN_PORT="$(port_by_ip_in_run "$brrun" "192.168.30.1/28" | tr -d '\r' | xargs)"
+
+  if [ -z "$BR_RTR_ISP_PORT" ] || [ -z "$BR_RTR_LAN_PORT" ]; then
+    fail "BR-RTR: не нашёл все нужные IP в show running-config"
+    echo "Нужно, чтобы минималка была применена:"
+    echo "  172.16.2.2/28"
+    echo "  192.168.30.1/28"
+    echo "Лог: $brrun"
+    grep -n "interface gigabitethernet\\|ip address" "$brrun" | tail -80 || true
+    return 1
+  fi
+
+  echo "[OK] Eltex detect:"
+  echo "  HQ-RTR: $HQ_RTR_ISP_PORT=172.16.1.2, $HQ_RTR_SRV_PORT=192.168.100.1, $HQ_RTR_CLI_PORT=192.168.200.1"
+  echo "  BR-RTR: $BR_RTR_ISP_PORT=172.16.2.2, $BR_RTR_LAN_PORT=192.168.30.1"
+}
+
+
+configure_isp(){
+  info "Настраиваю ISP автоматически"
+  auto_detect_isp_interfaces || return 1
+
+  info "ISP: WAN=$WAN_IF, HQ=$HQ_IF, BR=$BR_IF"
+
+  hostnamectl set-hostname isp >/tmp/demoexam_isp.err 2>&1 || true
+
+  ensure_con(){
+    local iface="$1" name="$2" current=""
+    current=$(nmcli -t -f NAME,DEVICE con show | awk -F: -v dev="$iface" '$2==dev {print $1; exit}') || true
+    if nmcli con show "$name" >/dev/null 2>&1; then
+      nmcli con mod "$name" connection.interface-name "$iface" >/dev/null 2>>/tmp/demoexam_isp.err || true
+    elif [ -n "$current" ]; then
+      nmcli con mod "$current" connection.id "$name" >/dev/null 2>>/tmp/demoexam_isp.err || true
+    else
+      nmcli con add type ethernet ifname "$iface" con-name "$name" >/dev/null 2>>/tmp/demoexam_isp.err || true
+    fi
+  }
+
+  ensure_con "$WAN_IF" ISP-WAN
+  ensure_con "$HQ_IF" ISP-HQ
+  ensure_con "$BR_IF" ISP-BR
+
+  nmcli con mod ISP-WAN ipv4.method auto >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+  nmcli con mod ISP-HQ ipv4.addresses 172.16.1.1/28 ipv4.method manual >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+  nmcli con mod ISP-BR ipv4.addresses 172.16.2.1/28 ipv4.method manual >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+
+  nmcli con up ISP-WAN >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+  nmcli con up ISP-HQ >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+  nmcli con up ISP-BR >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+
+  cat > /etc/sysctl.d/99-ip-forward.conf <<'EOF'
+net.ipv4.ip_forward=1
+EOF
+  sysctl --system >/dev/null 2>>/tmp/demoexam_isp.err || true
+
+  mkdir -p /etc/nftables
+  cat > /etc/nftables/isp.nft <<EOF
+table inet nat {
+    chain POSTROUTING {
+        type nat hook postrouting priority srcnat;
+        oifname "$WAN_IF" masquerade
+    }
+}
+EOF
+
+  grep -q '/etc/nftables/isp.nft' /etc/sysconfig/nftables.conf 2>/dev/null || echo 'include "/etc/nftables/isp.nft"' >> /etc/sysconfig/nftables.conf
+
+  systemctl enable --now nftables >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+  systemctl restart nftables >/dev/null 2>>/tmp/demoexam_isp.err || return 1
+
+  echo "[..] ISP: проверяю пакеты chrony nginx httpd-tools, ничего не устанавливаю"
+  timeout 10 rpm -q chrony nginx httpd-tools >/tmp/demoexam_isp_packages_check.log 2>&1 || {
+    echo "[WARN] ISP: не все пакеты найдены. Лог: /tmp/demoexam_isp_packages_check.log"
+    cat /tmp/demoexam_isp_packages_check.log
+  }
+
+  cat > /etc/chrony.conf <<'EOF'
+server ntp1.vniiftri.ru iburst prefer
+server ntp2.vniiftri.ru iburst
+local stratum 5
+allow 0.0.0.0/0
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+EOF
+
+  systemctl enable --now chronyd >/dev/null 2>>/tmp/demoexam_isp.err || true
+  systemctl restart chronyd >/dev/null 2>>/tmp/demoexam_isp.err || true
+
+  mkdir -p /etc/nginx/conf.d
+  cat > /etc/nginx/conf.d/docker.conf <<'EOF'
+server {
+    listen 80;
+    server_name docker.sirius-exam.org;
+    location / {
+        proxy_pass http://172.16.2.2:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOF
+
+  htpasswd -b -c /etc/nginx/.htpasswd WEB 'P@ssw0rd' >/dev/null 2>>/tmp/demoexam_isp.err || true
+
+  cat > /etc/nginx/conf.d/web.conf <<'EOF'
+server {
+    listen 80;
+    server_name web.sirius-exam.org;
+    location / {
+        proxy_pass http://172.16.1.2:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        auth_basic "Restricted area";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+    }
+}
+EOF
+
+  nginx -t >/tmp/demoexam_nginx_test.err 2>&1 && systemctl restart nginx >/dev/null 2>>/tmp/demoexam_isp.err || true
+
+  ip route replace 192.168.100.0/27 via 172.16.1.2 2>/dev/null || true
+  ip route replace 192.168.200.0/28 via 172.16.1.2 2>/dev/null || true
+  ip route replace 192.168.99.0/29 via 172.16.1.2 2>/dev/null || true
+  ip route replace 192.168.30.0/28 via 172.16.2.2 2>/dev/null || true
+
+  ok "ISP настроен"
+}
+
+print_hq_rtr_bootstrap(){
+  cat <<EOF
+[WAIT] ШАГ — HQ-RTR bootstrap
+
+Как узнать порт:
+  На HQ-RTR: show interfaces status
+  На хосте KVM: virsh domiflist HQ-RTR
+  Сравни MAC. Порт к сети ISP-HQ сейчас выбран: $HQR_ISP_PORT
+
+Вставь в консоль HQ-RTR:
+
+# Если пароль admin уже менялся раньше, первые 3 строки можно пропустить.
+password Admin1234
+commit
+confirm
+configure terminal
+hostname hq-rtr.sirius-exam.org
+username net_admin
+ password P@ssw0rd
+ privilege 15
+exit
+interface $HQR_ISP_PORT
+ ip firewall disable
+ ip address 172.16.1.2/28
+exit
+ip route 0.0.0.0/0 172.16.1.1
+ip ssh server
+do commit
+do confirm
+
+EOF
+}
+
+print_br_rtr_bootstrap(){
+  cat <<EOF
+[WAIT] ШАГ — BR-RTR bootstrap
+
+Как узнать порт:
+  На BR-RTR: show interfaces status
+  На хосте KVM: virsh domiflist BR-RTR
+  Сравни MAC. Порт к сети ISP-BR сейчас выбран: $BRR_ISP_PORT
+
+Вставь в консоль BR-RTR:
+
+# Если пароль admin уже менялся раньше, первые 3 строки можно пропустить.
+password Admin1234
+commit
+confirm
+configure terminal
+hostname br-rtr.sirius-exam.org
+username net_admin
+ password P@ssw0rd
+ privilege 15
+exit
+interface $BRR_ISP_PORT
+ ip firewall disable
+ ip address 172.16.2.2/28
+exit
+ip route 0.0.0.0/0 172.16.2.1
+ip ssh server
+do commit
+do confirm
+
+EOF
+}
+
+vesr_expect_hq(){
+  local ip="$1" err="/tmp/demoexam_hq_rtr.err" tmp="/tmp/demoexam_hq_rtr.expect"
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/expect -f
+set timeout 120
+set ip [lindex $argv 0]
+set user "net_admin"
+set pass "P@ssw0rd"
+log_user 0
+log_file -noappend /tmp/demoexam_vesr_expect.log
+send_user -- "STEP SSH_CONNECT: подключаюсь к VESR\n"
+proc c {cmd} {
+    send_user -- "STEP CMD: $cmd\n"
+    send -- "$cmd\r"
+    expect {
+        -re {More\?.*} { send " "; exp_continue }
+        -re {[#>]} {}
+        timeout { send_user -- "ERROR TIMEOUT: команда не получила prompt: $cmd\n"; exit 20 }
+        eof { send_user -- "ERROR EOF: соединение закрыто на команде: $cmd\n"; exit 21 }
+    }
+}
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 $user@$ip
+expect {
+    -re "yes/no" { send_user -- "STEP SSH_HOSTKEY: принимаю host key\n"; send "yes\r"; exp_continue }
+    -re "(P|p)assword:" { send_user -- "STEP SSH_PASSWORD: отправляю пароль\n"; send "$pass\r" }
+    timeout { send_user -- "ERROR SSH: нет запроса пароля\n"; exit 10 }
+    eof { send_user -- "ERROR SSH: соединение закрыто до пароля\n"; exit 11 }
+}
+expect {
+    -re {[#>]} { send_user -- "STEP SSH_LOGIN_OK: вошли в VESR\n" }
+    -re "(P|p)assword:" { send_user -- "ERROR SSH: пароль не принят\n"; exit 12 }
+    timeout { send_user -- "ERROR SSH: вошли, но prompt не появился\n"; exit 13 }
+    eof { send_user -- "ERROR SSH: соединение закрыто после пароля\n"; exit 14 }
+}
+c "configure terminal"
+c "hostname hq-rtr.sirius-exam.org"
+c "username net_admin"
+c "password P@ssw0rd"
+c "privilege 15"
+c "exit"
+c "domain lookup enable"
+c "object-group network PUBLIC_POOL"
+c "ip address-range 172.16.1.3-172.16.1.7"
+c "exit"
+c "interface __HQR_ISP_PORT__"
+c "ip firewall disable"
+c "ip address 172.16.1.2/28"
+c "ip nat proxy-arp PUBLIC_POOL"
+c "exit"
+c "interface __HQR_SRV_PORT__"
+c "ip firewall disable"
+c "ip address 192.168.100.1/27"
+c "exit"
+c "interface __HQR_CLI_PORT__"
+c "ip firewall disable"
+c "ip address 192.168.200.1/28"
+c "exit"
+send_user -- "STEP SKIP: HQ-MGMT отсутствует, интерфейс не настраиваю\n"
+c "key-chain auth_ospf"
+c "key 1"
+c "key-string ascii-text P@ssw0rd"
+c "exit"
+c "exit"
+c "router ospf 1"
+c "router-id 10.10.10.1"
+c "area 0.0.0.0"
+c "network 192.168.100.0/27"
+c "network 192.168.200.0/28"
+send_user -- "STEP SKIP: HQ-MGMT OSPF network skipped
+"
+c "network 10.10.10.0/30"
+c "enable"
+c "exit"
+c "enable"
+c "exit"
+c "tunnel gre 1"
+c "description \"to-br-rtr\""
+c "ttl 255"
+c "ip firewall disable"
+c "local address 172.16.1.2"
+c "remote address 172.16.2.2"
+c "ip address 10.10.10.1/30"
+c "ip ospf instance 1"
+c "ip ospf authentication key-chain auth_ospf"
+c "ip ospf authentication algorithm md5"
+c "ip ospf"
+c "enable"
+c "exit"
+c "nat source"
+c "pool TRANSLATE_ADDRESS"
+c "ip address-range 172.16.1.3-172.16.1.7"
+c "exit"
+c "ruleset SNAT"
+c "to interface __HQR_ISP_PORT__"
+c "rule 1"
+c "match source-address prefix 192.168.100.0/27"
+c "action source-nat pool TRANSLATE_ADDRESS"
+c "enable"
+c "exit"
+c "rule 2"
+c "match source-address prefix 192.168.200.0/28"
+c "action source-nat pool TRANSLATE_ADDRESS"
+c "enable"
+c "exit"
+send_user -- "STEP SKIP: HQ-MGMT SNAT rule skipped
+"
+c "exit"
+c "exit"
+c "ip dhcp-server"
+c "ip dhcp-server pool CLI_POOL"
+c "network 192.168.200.0/28"
+c "domain-name sirius-exam.org"
+c "address-range 192.168.200.3-192.168.200.14"
+c "default-router 192.168.200.1"
+c "dns-server 192.168.100.2"
+c "exit"
+c "nat destination"
+c "pool HQ_WEB"
+c "ip address 192.168.100.2"
+c "ip port 80"
+c "exit"
+c "pool HQ_SSH"
+c "ip address 192.168.100.2"
+c "ip port 2026"
+c "exit"
+c "ruleset DNAT"
+c "from default"
+c "rule 1"
+c "match protocol tcp"
+c "match destination-address prefix 172.16.1.2/32"
+c "match destination-port port-range 8080"
+c "action destination-nat pool HQ_WEB"
+c "enable"
+c "exit"
+c "rule 2"
+c "match protocol tcp"
+c "match destination-address prefix 172.16.1.2/32"
+c "match destination-port port-range 2026"
+c "action destination-nat pool HQ_SSH"
+c "enable"
+c "exit"
+c "exit"
+c "exit"
+c "ip route 0.0.0.0/0 172.16.1.1"
+c "ip ssh server"
+c "ntp enable"
+c "ntp broadcast-client enable"
+c "do commit"
+c "do confirm"
+c "exit"
+EOF
+  chmod +x "$tmp"
+  sed -i \
+    -e "s#__HQR_ISP_PORT__#$HQR_ISP_PORT#g" \
+    -e "s#__HQR_SRV_PORT__#$HQR_SRV_PORT#g" \
+    -e "s#__HQR_CLI_PORT__#$HQR_CLI_PORT#g" "$tmp"
+  echo "[..] HQ-RTR expect: подробный лог команд ниже"
+  echo "[..] HQ-RTR ports: ISP=$HQR_ISP_PORT, SRV=$HQR_SRV_PORT, CLI=$HQR_CLI_PORT"
+  "$tmp" "$ip" 2>"$err" | tee /tmp/demoexam_hq_rtr_steps.log
+  local rc=${PIPESTATUS[0]}
+  echo "[INFO] HQ-RTR expect log: /tmp/demoexam_hq_rtr_steps.log"
+  return $rc
+}
+
+vesr_expect_br(){
+  local ip="$1" err="/tmp/demoexam_br_rtr.err" tmp="/tmp/demoexam_br_rtr.expect"
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/expect -f
+set timeout 120
+set ip [lindex $argv 0]
+set user "net_admin"
+set pass "P@ssw0rd"
+log_user 0
+log_file -noappend /tmp/demoexam_vesr_expect.log
+send_user -- "STEP SSH_CONNECT: подключаюсь к VESR\n"
+proc c {cmd} {
+    send_user -- "STEP CMD: $cmd\n"
+    send -- "$cmd\r"
+    expect {
+        -re {More\?.*} { send " "; exp_continue }
+        -re {[#>]} {}
+        timeout { send_user -- "ERROR TIMEOUT: команда не получила prompt: $cmd\n"; exit 20 }
+        eof { send_user -- "ERROR EOF: соединение закрыто на команде: $cmd\n"; exit 21 }
+    }
+}
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 $user@$ip
+expect {
+    -re "yes/no" { send_user -- "STEP SSH_HOSTKEY: принимаю host key\n"; send "yes\r"; exp_continue }
+    -re "(P|p)assword:" { send_user -- "STEP SSH_PASSWORD: отправляю пароль\n"; send "$pass\r" }
+    timeout { send_user -- "ERROR SSH: нет запроса пароля\n"; exit 10 }
+    eof { send_user -- "ERROR SSH: соединение закрыто до пароля\n"; exit 11 }
+}
+expect {
+    -re {[#>]} { send_user -- "STEP SSH_LOGIN_OK: вошли в VESR\n" }
+    -re "(P|p)assword:" { send_user -- "ERROR SSH: пароль не принят\n"; exit 12 }
+    timeout { send_user -- "ERROR SSH: вошли, но prompt не появился\n"; exit 13 }
+    eof { send_user -- "ERROR SSH: соединение закрыто после пароля\n"; exit 14 }
+}
+c "configure terminal"
+c "hostname br-rtr.sirius-exam.org"
+c "username net_admin"
+c "password P@ssw0rd"
+c "privilege 15"
+c "exit"
+c "domain lookup enable"
+c "object-group network PUBLIC_POOL"
+c "ip address-range 172.16.2.3-172.16.2.7"
+c "exit"
+c "interface __BRR_LAN_PORT__"
+c "ip firewall disable"
+c "ip address 192.168.30.1/28"
+c "exit"
+c "interface __BRR_ISP_PORT__"
+c "ip firewall disable"
+c "ip address 172.16.2.2/28"
+c "ip nat proxy-arp PUBLIC_POOL"
+c "exit"
+c "key-chain auth_ospf"
+c "key 1"
+c "key-string ascii-text P@ssw0rd"
+c "exit"
+c "exit"
+c "router ospf 1"
+c "router-id 10.10.10.2"
+c "area 0.0.0.0"
+c "network 192.168.30.0/28"
+c "network 10.10.10.0/30"
+c "enable"
+c "exit"
+c "enable"
+c "exit"
+c "tunnel gre 1"
+c "description \"to-hq-rtr\""
+c "ttl 255"
+c "ip firewall disable"
+c "local address 172.16.2.2"
+c "remote address 172.16.1.2"
+c "ip address 10.10.10.2/30"
+c "ip ospf instance 1"
+c "ip ospf authentication key-chain auth_ospf"
+c "ip ospf authentication algorithm md5"
+c "ip ospf"
+c "enable"
+c "exit"
+c "nat source"
+c "pool TRANSLATE_ADDRESS"
+c "ip address-range 172.16.2.3-172.16.2.7"
+c "exit"
+c "ruleset SNAT"
+c "to interface __BRR_ISP_PORT__"
+c "rule 1"
+c "match source-address prefix 192.168.30.0/28"
+c "action source-nat pool TRANSLATE_ADDRESS"
+c "enable"
+c "exit"
+c "exit"
+c "exit"
+c "nat destination"
+c "pool BR_DOCKER"
+c "ip address 192.168.30.2"
+c "ip port 8080"
+c "exit"
+c "pool BR_SSH"
+c "ip address 192.168.30.2"
+c "ip port 2026"
+c "exit"
+c "ruleset DNAT"
+c "from default"
+c "rule 1"
+c "match protocol tcp"
+c "match destination-address prefix 172.16.2.2/32"
+c "match destination-port port-range 8080"
+c "action destination-nat pool BR_DOCKER"
+c "enable"
+c "exit"
+c "rule 2"
+c "match protocol tcp"
+c "match destination-address prefix 172.16.2.2/32"
+c "match destination-port port-range 2026"
+c "action destination-nat pool BR_SSH"
+c "enable"
+c "exit"
+c "exit"
+c "exit"
+c "ip route 0.0.0.0/0 172.16.2.1"
+c "ip ssh server"
+c "ntp enable"
+c "ntp server 172.16.2.1"
+c "ntp broadcast-client enable"
+c "do commit"
+c "do confirm"
+c "exit"
+EOF
+  chmod +x "$tmp"
+  sed -i \
+    -e "s#__BRR_LAN_PORT__#$BRR_LAN_PORT#g" \
+    -e "s#__BRR_ISP_PORT__#$BRR_ISP_PORT#g" "$tmp"
+  echo "[..] BR-RTR expect: подробный лог команд ниже"
+  echo "[..] BR-RTR ports: LAN=$BRR_LAN_PORT, ISP=$BRR_ISP_PORT"
+  "$tmp" "$ip" 2>"$err" | tee /tmp/demoexam_br_rtr_steps.log
+  local rc=${PIPESTATUS[0]}
+  echo "[INFO] BR-RTR expect log: /tmp/demoexam_br_rtr_steps.log"
+  return $rc
+}
+
+
+vesr_check_hq_ips(){
+  local ip="$1"
+  local tmp="/tmp/demoexam_hq_rtr_check.expect"
+  local out="/tmp/demoexam_hq_rtr_check.log"
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/expect -f
+set timeout 60
+set ip [lindex $argv 0]
+set user "net_admin"
+set pass "P@ssw0rd"
+set isp_port $env(HQ_RTR_ISP_PORT)
+set srv_port $env(HQ_RTR_SRV_PORT)
+set cli_port $env(HQ_RTR_CLI_PORT)
+log_user 1
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 $user@$ip
+expect {
+    -re "yes/no" { send "yes\r"; exp_continue }
+    -re "(P|p)assword:" { send "$pass\r" }
+    timeout { exit 10 }
+    eof { exit 11 }
+}
+expect -re {[#>]}
+send "show ip interfaces $isp_port\r"
+expect -re {[#>]}
+send "show ip interfaces $srv_port\r"
+expect -re {[#>]}
+send "show ip interfaces $cli_port\r"
+expect -re {[#>]}
+send "exit\r"
+EOF
+  chmod +x "$tmp"
+  "$tmp" "$ip" > "$out" 2>&1 || return 1
+
+  grep -q "172.16.1.2/28" "$out" || { echo "[FAIL] HQ-RTR check: нет 172.16.1.2/28 на $HQ_RTR_ISP_PORT"; tail -40 "$out"; return 1; }
+  grep -q "192.168.100.1/27" "$out" || { echo "[FAIL] HQ-RTR check: нет 192.168.100.1/27 на $HQ_RTR_SRV_PORT"; tail -40 "$out"; return 1; }
+  grep -q "192.168.200.1/28" "$out" || { echo "[FAIL] HQ-RTR check: нет 192.168.200.1/28 на $HQ_RTR_CLI_PORT"; tail -40 "$out"; return 1; }
+  echo "[OK] HQ-RTR check: адреса на ISP/SRV/CLI портах есть"
+}
+
+configure_hq_rtr(){
+  local ip="172.16.1.2"
+  export HQ_RTR_ISP_PORT HQ_RTR_SRV_PORT HQ_RTR_CLI_PORT
+
+  echo "[..] HQ-RTR: проверяю ping $ip"
+  if ! check_ping "$ip"; then
+    print_hq_rtr_bootstrap
+    wait_enter
+    echo "[..] HQ-RTR: повторно проверяю ping $ip"
+    if ! check_ping "$ip"; then
+      fail "HQ-RTR не отвечает на ping $ip"
+      echo "Проверь на HQ-RTR: show ip interfaces $HQ_RTR_ISP_PORT"
+      return 1
+    fi
+  fi
+  echo "[OK] HQ-RTR ping есть"
+
+  echo "[..] HQ-RTR: пробую SSH net_admin@172.16.1.2 и отправляю полный конфиг"
+  rm -f /tmp/demoexam_hq_rtr.err /tmp/demoexam_vesr_expect.log
+  if vesr_expect_hq "$ip"; then
+    vesr_check_hq_ips "$ip" || echo "[WARN] HQ-RTR: post-check не прошёл, но конфиг отправлен. Дальше проверит ping HQ-SRV."
+    ok "HQ-RTR настроен"
+  else
+    fail "HQ-RTR не настроен"
+    show_tail_err /tmp/demoexam_hq_rtr.err
+    show_tail_err /tmp/demoexam_hq_rtr_steps.log
+    show_tail_err /tmp/demoexam_hq_rtr_check.log
+    show_tail_err /tmp/demoexam_br_rtr_steps.log
+    show_tail_err /tmp/demoexam_vesr_expect.log
+    echo "Проверь вручную с ISP: ssh net_admin@$ip"
+    return 1
+  fi
+}
+
+
+vesr_check_br_ips(){
+  local ip="$1"
+  local tmp="/tmp/demoexam_br_rtr_check.expect"
+  local out="/tmp/demoexam_br_rtr_check.log"
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/expect -f
+set timeout 60
+set ip [lindex $argv 0]
+set user "net_admin"
+set pass "P@ssw0rd"
+set lan_port $env(BR_RTR_LAN_PORT)
+set isp_port $env(BR_RTR_ISP_PORT)
+log_user 1
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 $user@$ip
+expect {
+    -re "yes/no" { send "yes\r"; exp_continue }
+    -re "(P|p)assword:" { send "$pass\r" }
+    timeout { exit 10 }
+    eof { exit 11 }
+}
+expect -re {[#>]}
+send "show ip interfaces $lan_port\r"
+expect -re {[#>]}
+send "show ip interfaces $isp_port\r"
+expect -re {[#>]}
+send "exit\r"
+EOF
+  chmod +x "$tmp"
+  "$tmp" "$ip" > "$out" 2>&1 || return 1
+
+  grep -q "192.168.30.1/28" "$out" || { echo "[FAIL] BR-RTR check: нет 192.168.30.1/28 на $BR_RTR_LAN_PORT"; tail -40 "$out"; return 1; }
+  grep -q "172.16.2.2/28" "$out" || { echo "[FAIL] BR-RTR check: нет 172.16.2.2/28 на $BR_RTR_ISP_PORT"; tail -40 "$out"; return 1; }
+  echo "[OK] BR-RTR check: адреса на LAN/ISP портах есть"
+}
+
+configure_br_rtr(){
+  local ip="172.16.2.2"
+  export BR_RTR_LAN_PORT BR_RTR_ISP_PORT
+
+  echo "[..] BR-RTR: проверяю ping $ip"
+  if ! check_ping "$ip"; then
+    print_br_rtr_bootstrap
+    wait_enter
+    echo "[..] BR-RTR: повторно проверяю ping $ip"
+    if ! check_ping "$ip"; then
+      fail "BR-RTR не отвечает на ping $ip"
+      echo "Проверь на BR-RTR: show ip interfaces $BR_RTR_ISP_PORT"
+      return 1
+    fi
+  fi
+  echo "[OK] BR-RTR ping есть"
+
+  echo "[..] BR-RTR: пробую SSH net_admin@172.16.2.2 и отправляю полный конфиг"
+  rm -f /tmp/demoexam_br_rtr.err /tmp/demoexam_vesr_expect.log
+  if vesr_expect_br "$ip"; then
+    vesr_check_br_ips "$ip" || echo "[WARN] BR-RTR: post-check не прошёл, но конфиг отправлен. Дальше проверит ping BR-SRV."
+    ok "BR-RTR настроен"
+  else
+    fail "BR-RTR не настроен"
+    show_tail_err /tmp/demoexam_br_rtr.err
+    show_tail_err /tmp/demoexam_br_rtr_check.log
+    show_tail_err /tmp/demoexam_vesr_expect.log
+    echo "Проверь вручную с ISP: ssh net_admin@$ip"
+    return 1
+  fi
+}
+
+linux_hint_hq_srv(){
+  cat <<HINT_HQ_SRV
+[WAIT] ШАГ — HQ-SRV SSH
+
+Минимум для доступа. На HQ-SRV вставь.
+Интерфейс: enp7s1
+
+nmcli con add type ethernet ifname enp7s1 con-name HQ-SRV ipv4.addresses 192.168.100.2/27 ipv4.gateway 192.168.100.1 ipv4.method manual 2>/dev/null || true
+nmcli con mod HQ-SRV ipv4.addresses 192.168.100.2/27 ipv4.gateway 192.168.100.1 ipv4.method manual
+nmcli con up HQ-SRV
+passwd root
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+ssh-keygen -A
+sshd -t
+systemctl enable --now sshd
+systemctl restart sshd
+ip -br a
+ping -c 3 192.168.100.1
+
+После этого с ISP проверь:
+ping -c 3 192.168.100.2
+ssh root@192.168.100.2
+
+Потом вернись в скрипт и нажми Enter.
+HINT_HQ_SRV
+}
+
+
+linux_hint_br_srv(){
+  cat <<HINT_BR_SRV
+[WAIT] ШАГ — BR-SRV SSH
+
+Минимум для доступа. На BR-SRV вставь.
+Интерфейс: enp7s1
+
+nmcli con add type ethernet ifname enp7s1 con-name BR-SRV ipv4.addresses 192.168.30.2/28 ipv4.gateway 192.168.30.1 ipv4.method manual 2>/dev/null || true
+nmcli con mod BR-SRV ipv4.addresses 192.168.30.2/28 ipv4.gateway 192.168.30.1 ipv4.method manual
+nmcli con up BR-SRV
+passwd root
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+ssh-keygen -A
+sshd -t
+systemctl enable --now sshd
+systemctl restart sshd
+ip -br a
+ping -c 3 192.168.30.1
+
+После этого с ISP проверь:
+ping -c 3 192.168.30.2
+ssh root@192.168.30.2
+
+Потом вернись в скрипт и нажми Enter.
+HINT_BR_SRV
+}
+
+
+linux_hint_hq_cli(){
+  cat <<HINT_HQ_CLI
+[WAIT] ШАГ — HQ-CLI SSH
+
+Минимум для доступа. На HQ-CLI вставь.
+Интерфейс: enp7s1
+
+nmcli con add type ethernet ifname enp7s1 con-name HQ-CLI ipv4.addresses 192.168.200.3/28 ipv4.gateway 192.168.200.1 ipv4.method manual 2>/dev/null || true
+nmcli con mod HQ-CLI ipv4.addresses 192.168.200.3/28 ipv4.gateway 192.168.200.1 ipv4.method manual
+nmcli con up HQ-CLI
+passwd root
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+ssh-keygen -A
+sshd -t
+systemctl enable --now sshd
+systemctl restart sshd
+ip -br a
+ping -c 3 192.168.200.1
+
+После этого с ISP проверь:
+ping -c 3 192.168.200.3
+ssh root@192.168.200.3
+
+Потом вернись в скрипт и нажми Enter.
+HINT_HQ_CLI
+}
+
+
+hq_srv_payload(){
+cat <<'REMOTE'
+set -euo pipefail
+
+remote_step(){ echo "REMOTE_STATUS: START: $1"; }
+remote_done(){ echo "REMOTE_STATUS: OK: $1"; }
+remote_skip(){ echo "REMOTE_STATUS: SKIP: $1"; }
+
+
+safe_dnf_install(){
+  echo "REMOTE_STATUS: START: HQ-SRV: проверяю пакеты, ничего не устанавливаю"
+  local pkgs="policycoreutils-python-utils bind bind-utils chrony mdadm nfs-utils nfs4-acl-tools httpd php php-mysqlnd mariadb-server mariadb"
+  local missing=""
+  for p in $pkgs; do
+    timeout 5 rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"
+  done
+  if [ -n "$missing" ]; then
+    echo "REMOTE_STATUS: WARN: HQ-SRV: не найдены пакеты:$missing"
+    echo "REMOTE_STATUS: WARN: HQ-SRV: установка через dnf отключена, продолжаю"
+  else
+    echo "REMOTE_STATUS: OK: HQ-SRV: все нужные пакеты уже установлены"
+  fi
+}
+
+remote_step 'HQ-SRV: hostname и SSH'
+hostnamectl set-hostname hq-srv.sirius-exam.org || true
+useradd sshuser -u 2026 -U 2>/dev/null || true
+echo "sshuser:P@ssw0rd" | chpasswd
+echo 'sshuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/sshuser
+chmod 440 /etc/sudoers.d/sshuser
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.demo 2>/dev/null || true
+cat > /etc/ssh/sshd_config <<'SSHD_EOF'
+Port 22
+Port 2026
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UsePAM yes
+MaxAuthTries 2
+AllowUsers root sshuser
+X11Forwarding yes
+Subsystem sftp /usr/libexec/openssh/sftp-server
+SSHD_EOF
+ssh-keygen -A >/dev/null 2>&1 || true
+remote_step 'HQ-SRV: проверка пакетов без установки'
+safe_dnf_install
+remote_done 'HQ-SRV: проверка пакетов завершена'
+semanage port -a -t ssh_port_t -p tcp 2026 2>/dev/null || semanage port -m -t ssh_port_t -p tcp 2026 2>/dev/null || true
+firewall-cmd --permanent --add-port=2026/tcp >/dev/null 2>&1 || true
+firewall-cmd --permanent --add-service=dns >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
+systemctl restart sshd || true
+remote_done 'HQ-SRV: hostname и SSH'
+remote_step 'HQ-SRV: DNS/BIND'
+mkdir -p /var/named/master
+cat > /etc/named.conf <<'EOF'
+options {
+    listen-on port 53 { any; };
+    listen-on-v6 port 53 { none; };
+    directory "/var/named";
+    allow-query { any; };
+    recursion yes;
+    forward first;
+    forwarders { 77.88.8.7; 77.88.8.3; };
+    dnssec-validation no;
+};
+zone "sirius-exam.org" IN { type master; file "master/sirius-exam.org.zone"; };
+zone "100.168.192.in-addr.arpa" IN { type master; file "master/192.168.100.rev"; };
+zone "200.168.192.in-addr.arpa" IN { type master; file "master/192.168.200.rev"; };
+zone "30.168.192.in-addr.arpa" IN { type master; file "master/192.168.30.rev"; };
+include "/etc/named.rfc1912.zones";
+include "/etc/named.root.key";
+EOF
+cat > /var/named/master/sirius-exam.org.zone <<'EOF'
+$TTL 604800
+@ IN SOA hq-srv.sirius-exam.org. root.sirius-exam.org. (1 600 3600 1w 360)
+  IN NS hq-srv.sirius-exam.org.
+isp IN A 172.16.1.1
+hq-rtr IN A 192.168.100.1
+br-rtr IN A 192.168.30.1
+hq-srv IN A 192.168.100.2
+hq-cli IN A 192.168.200.3
+br-srv IN A 192.168.30.2
+web IN A 172.16.1.1
+docker IN A 172.16.1.1
+nextcloud IN A 192.168.30.2
+EOF
+cat > /var/named/master/192.168.100.rev <<'EOF'
+$TTL 604800
+@ IN SOA hq-srv.sirius-exam.org. root.sirius-exam.org. (1 600 3600 1w 360)
+  IN NS hq-srv.sirius-exam.org.
+1 IN PTR hq-rtr.sirius-exam.org.
+2 IN PTR hq-srv.sirius-exam.org.
+EOF
+cat > /var/named/master/192.168.200.rev <<'EOF'
+$TTL 604800
+@ IN SOA hq-srv.sirius-exam.org. root.sirius-exam.org. (1 600 3600 1w 360)
+  IN NS hq-srv.sirius-exam.org.
+3 IN PTR hq-cli.sirius-exam.org.
+EOF
+cat > /var/named/master/192.168.30.rev <<'EOF'
+$TTL 604800
+@ IN SOA hq-srv.sirius-exam.org. root.sirius-exam.org. (1 600 3600 1w 360)
+  IN NS hq-srv.sirius-exam.org.
+1 IN PTR br-rtr.sirius-exam.org.
+2 IN PTR br-srv.sirius-exam.org.
+EOF
+chown -R root:named /var/named/master
+chmod 0640 /var/named/master/*
+named-checkconf
+named-checkzone sirius-exam.org /var/named/master/sirius-exam.org.zone >/dev/null
+systemctl enable --now named >/dev/null 2>&1
+systemctl restart named
+remote_done 'HQ-SRV: DNS/BIND готов'
+remote_step 'HQ-SRV: Chrony'
+cat > /etc/chrony.conf <<'EOF'
+server 172.16.1.1 iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+EOF
+systemctl enable --now chronyd >/dev/null 2>&1
+systemctl restart chronyd
+remote_done 'HQ-SRV: Chrony готов'
+remote_step 'HQ-SRV: проверяю дополнительные диски для RAID0'
+RAID_DEVS=()
+while read -r name type size; do
+  [ "$type" = "disk" ] || continue
+  [ "$name" = "sda" ] && continue
+  RAID_DEVS+=("/dev/$name")
+done < <(lsblk -dn -o NAME,TYPE,SIZE)
+
+if [ "${#RAID_DEVS[@]}" -ge 2 ]; then
+  echo "REMOTE_STATUS: START: HQ-SRV: найдены диски ${RAID_DEVS[0]} и ${RAID_DEVS[1]}, делаю RAID0"
+  if [ ! -b /dev/md0 ]; then
+    yes | mdadm --create --verbose /dev/md0 -l 0 -n 2 "${RAID_DEVS[0]}" "${RAID_DEVS[1]}" >/tmp/mdadm_create.err 2>&1 || true
+  fi
+  mdadm --detail --scan --verbose > /etc/mdadm.conf 2>/dev/null || true
+  blkid /dev/md0 >/dev/null 2>&1 || mkfs.ext4 -F /dev/md0 >/dev/null
+  mkdir -p /raid
+  mount /dev/md0 /raid 2>/dev/null || true
+  grep -q '^/dev/md0 /raid' /etc/fstab || echo '/dev/md0 /raid ext4 defaults 0 0' >> /etc/fstab
+  remote_done 'HQ-SRV: RAID0 готов'
+else
+  remote_skip 'HQ-SRV: дополнительных дисков меньше двух — RAID0 пропущен'
+  mkdir -p /raid
+fi
+
+remote_step 'HQ-SRV: NFS'
+mkdir -p /raid/nfs
+chmod -R 777 /raid/nfs
+echo '/raid/nfs 192.168.200.0/28(rw,no_root_squash)' > /etc/exports
+systemctl enable --now nfs-server.service >/dev/null 2>&1
+exportfs -arv >/dev/null
+remote_done 'HQ-SRV: NFS готов'
+remote_step 'HQ-SRV: Apache + MariaDB'
+systemctl enable --now mariadb >/dev/null 2>&1
+systemctl enable --now httpd >/dev/null 2>&1
+remote_step 'HQ-SRV: создаю БД webdb и пользователя web'
+mysql -u root <<'EOF'
+CREATE DATABASE IF NOT EXISTS webdb;
+CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
+CREATE USER IF NOT EXISTS 'web'@'%' IDENTIFIED BY 'P@ssw0rd';
+GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
+GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%';
+FLUSH PRIVILEGES;
+EOF
+remote_done 'HQ-SRV: БД готова'
+remote_step 'HQ-SRV: подключаю Additional.iso для web-файлов'
+mkdir -p /mnt/additional
+if ! mountpoint -q /mnt/additional; then
+  for dev in /dev/sr0 /dev/cdrom /dev/vdd /dev/vdc /dev/vdb /dev/sdb /dev/sdc /dev/sdd /dev/disk/by-label/* /dev/disk/by-id/*; do
+    [ -e "$dev" ] || continue
+    mount -o ro "$dev" /mnt/additional >/tmp/mount_additional.err 2>&1 && break
+  done
+fi
+if mountpoint -q /mnt/additional; then
+  echo 'REMOTE_STATUS: OK: Additional.iso смонтирован'
+else
+  echo 'REMOTE_STATUS: SKIP: Additional.iso не смонтирован, смотри /tmp/mount_additional.err'
+fi
+if [ -f /mnt/additional/web/dump.sql ]; then
+  remote_step 'HQ-SRV: импорт dump.sql'
+  mysql -u root webdb < /mnt/additional/web/dump.sql || true
+  remote_done 'HQ-SRV: dump.sql импортирован'
+else
+  remote_skip 'HQ-SRV: dump.sql не найден'
+fi
+if [ -f /mnt/additional/web/index.php ]; then cp /mnt/additional/web/index.php /var/www/html/; remote_done 'HQ-SRV: index.php скопирован'; else remote_skip 'HQ-SRV: index.php не найден'; fi
+if [ -d /mnt/additional/web/images ]; then cp -r /mnt/additional/web/images /var/www/html/; remote_done 'HQ-SRV: images скопированы'; else remote_skip 'HQ-SRV: images не найдены'; fi
+systemctl restart mariadb
+systemctl restart httpd
+remote_done 'HQ-SRV: Apache + MariaDB готовы'
+remote_done 'HQ-SRV: готов'
+REMOTE
+}
+
+br_srv_payload(){
+cat <<'REMOTE'
+set -euo pipefail
+
+remote_step(){ echo "REMOTE_STATUS: START: $1"; }
+remote_done(){ echo "REMOTE_STATUS: OK: $1"; }
+remote_skip(){ echo "REMOTE_STATUS: SKIP: $1"; }
+
+hostnamectl set-hostname br-srv.sirius-exam.org || true
+useradd sshuser -u 2026 -U 2>/dev/null || true
+echo "sshuser:P@ssw0rd" | chpasswd
+echo 'sshuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/sshuser
+chmod 440 /etc/sudoers.d/sshuser
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.demo 2>/dev/null || true
+cat > /etc/ssh/sshd_config <<'SSHD_EOF'
+Port 22
+Port 2026
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UsePAM yes
+MaxAuthTries 2
+AllowUsers root sshuser
+X11Forwarding yes
+Subsystem sftp /usr/libexec/openssh/sftp-server
+SSHD_EOF
+ssh-keygen -A >/dev/null 2>&1 || true
+echo "REMOTE_STATUS: START: BR-SRV: проверяю пакеты, ничего не устанавливаю"
+BR_MISSING=""
+for p in policycoreutils-python-utils chrony samba samba-client cifs-utils nginx openssl; do
+  timeout 5 rpm -q "$p" >/dev/null 2>&1 || BR_MISSING="$BR_MISSING $p"
+done
+timeout 5 rpm -q docker-ce >/dev/null 2>&1 || timeout 5 rpm -q docker >/dev/null 2>&1 || BR_MISSING="$BR_MISSING docker/docker-ce"
+timeout 5 rpm -q docker-compose >/dev/null 2>&1 || timeout 5 rpm -q docker-compose-plugin >/dev/null 2>&1 || BR_MISSING="$BR_MISSING docker-compose"
+if [ -n "$BR_MISSING" ]; then
+  echo "REMOTE_STATUS: WARN: BR-SRV: не найдены пакеты:$BR_MISSING"
+  echo "REMOTE_STATUS: WARN: BR-SRV: установка через dnf отключена, продолжаю"
+else
+  echo "REMOTE_STATUS: OK: BR-SRV: пакеты уже установлены"
+fi
+semanage port -a -t ssh_port_t -p tcp 2026 2>/dev/null || semanage port -m -t ssh_port_t -p tcp 2026 2>/dev/null || true
+firewall-cmd --permanent --add-port=2026/tcp >/dev/null 2>&1 || true
+firewall-cmd --permanent --add-service=samba >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
+systemctl restart sshd || true
+cat > /etc/chrony.conf <<'EOF'
+server 172.16.2.1 iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+EOF
+systemctl enable --now chronyd >/dev/null 2>&1
+systemctl restart chronyd
+groupadd hq 2>/dev/null || true
+for i in 1 2 3 4 5; do
+  useradd -m -G hq hquser$i 2>/dev/null || true
+  usermod -aG hq hquser$i
+  echo "hquser$i:P@ssw0rd" | chpasswd
+  (echo 'P@ssw0rd'; echo 'P@ssw0rd') | smbpasswd -a hquser$i >/dev/null
+  smbpasswd -e hquser$i >/dev/null
+done
+mkdir -p /srv/samba/hq
+chown root:hq /srv/samba/hq
+chmod 2770 /srv/samba/hq
+cat > /etc/samba/smb.conf <<'EOF'
+[global]
+   workgroup = WORKGROUP
+   server string = BR-SRV Samba Server
+   security = user
+   map to guest = never
+   dns proxy = no
+[hq]
+   path = /srv/samba/hq
+   browseable = yes
+   writable = yes
+   valid users = @hq
+   create mask = 0660
+   directory mask = 2770
+   force group = hq
+EOF
+testparm -s >/dev/null
+setsebool -P samba_export_all_rw on >/dev/null 2>&1 || true
+semanage fcontext -a -t samba_share_t "/srv/samba/hq(/.*)?" 2>/dev/null || true
+restorecon -Rv /srv/samba/hq >/dev/null 2>&1 || true
+systemctl enable --now smb >/dev/null 2>&1
+systemctl enable --now nmb >/dev/null 2>&1 || true
+systemctl restart smb
+systemctl restart nmb 2>/dev/null || true
+
+echo 'REMOTE_STATUS: START: BR-SRV: Docker compose из экзаменационного compose.zip'
+systemctl enable --now docker >/dev/null 2>&1 || true
+
+mkdir -p /mnt/additional
+if ! mountpoint -q /mnt/additional; then
+  for dev in /dev/sr0 /dev/cdrom /dev/vdd /dev/vdc /dev/vdb /dev/sdb /dev/sdc /dev/sdd /dev/disk/by-label/* /dev/disk/by-id/*; do
+    [ -e "$dev" ] || continue
+    mount -o ro "$dev" /mnt/additional >/tmp/mount_additional.err 2>&1 && break
+  done
+fi
+if mountpoint -q /mnt/additional; then
+  echo 'REMOTE_STATUS: OK: Additional.iso смонтирован'
+else
+  echo 'REMOTE_STATUS: SKIP: Additional.iso не смонтирован, смотри /tmp/mount_additional.err'
+fi
+
+# Пытаемся загрузить локальные Docker-образы из Additional.iso, если они есть.
+if find /mnt/additional -type f -iname '*site*.tar' | head -1 | grep -q .; then
+  SITE_TAR="$(find /mnt/additional -type f -iname '*site*.tar' | head -1)"
+  echo "REMOTE_STATUS: START: BR-SRV: docker load $SITE_TAR"
+  docker load < "$SITE_TAR" >/tmp/br_srv_docker_site_load.log 2>&1 || true
+  echo 'REMOTE_STATUS: OK: BR-SRV: site image load завершён/пропущен'
+else
+  echo 'REMOTE_STATUS: SKIP: BR-SRV: site*.tar не найден на Additional.iso'
+fi
+
+if find /mnt/additional -type f \( -iname '*mariadb*.tar' -o -iname '*maria*.tar' \) | head -1 | grep -q .; then
+  DB_TAR="$(find /mnt/additional -type f \( -iname '*mariadb*.tar' -o -iname '*maria*.tar' \) | head -1)"
+  echo "REMOTE_STATUS: START: BR-SRV: docker load $DB_TAR"
+  docker load < "$DB_TAR" >/tmp/br_srv_docker_db_load.log 2>&1 || true
+  echo 'REMOTE_STATUS: OK: BR-SRV: mariadb image load завершён/пропущен'
+else
+  echo 'REMOTE_STATUS: SKIP: BR-SRV: mariadb*.tar не найден на Additional.iso'
+fi
+
+# Compose ждёт mariadb:11. На Additional.iso часто лежит mariadb:10.11 или mariadb:latest.
+# Ничего не скачиваем: делаем локальный tag на уже загруженный образ.
+if docker image inspect mariadb:11 >/dev/null 2>&1; then
+  echo 'REMOTE_STATUS: OK: BR-SRV: образ mariadb:11 есть'
+elif docker image inspect mariadb:10.11 >/dev/null 2>&1; then
+  docker tag mariadb:10.11 mariadb:11
+  echo 'REMOTE_STATUS: OK: BR-SRV: mariadb:10.11 отмечен как mariadb:11'
+elif docker image inspect mariadb:latest >/dev/null 2>&1; then
+  docker tag mariadb:latest mariadb:11
+  echo 'REMOTE_STATUS: OK: BR-SRV: mariadb:latest отмечен как mariadb:11'
+else
+  echo 'REMOTE_STATUS: WARN: BR-SRV: образ mariadb:11/10.11/latest не найден; compose НЕ будет скачивать из интернета'
+fi
+
+if docker image inspect site:latest >/dev/null 2>&1; then
+  echo 'REMOTE_STATUS: OK: BR-SRV: образ site:latest есть'
+else
+  echo 'REMOTE_STATUS: WARN: BR-SRV: образ site:latest не найден, приложение может не стартовать'
+fi
+
+mkdir -p /opt/exam-app
+cat > /opt/exam-app/.env <<'EOF'
+DEBUG=true
+CLIENT_APP_URL=http://localhost:3000
+LOGS_DIR=/app/logs
+
+DB_TYPE=maria
+DB_HOST=db
+DB_PORT=3306
+DB_NAME=appdb
+DB_USER=appuser
+DB_PASS=apppassword
+EOF
+
+cat > /opt/exam-app/docker-compose.yml <<'EOF'
+services:
+  app:
+    image: site:latest
+    ports:
+      - "8080:8000"
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: appdb
+      MARIADB_USER: appuser
+      MARIADB_PASSWORD: apppassword
+      MARIADB_ROOT_PASSWORD: rootpassword
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  db_data:
+EOF
+
+cd /opt/exam-app
+
+# Поддержка и docker compose v2, и старого docker-compose.
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE_CMD="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_CMD="docker-compose"
+else
+  echo 'REMOTE_STATUS: WARN: BR-SRV: docker compose/docker-compose не найден'
+  COMPOSE_CMD=""
+fi
+
+if [ -n "$COMPOSE_CMD" ]; then
+  if docker image inspect site:latest >/dev/null 2>&1 && docker image inspect mariadb:11 >/dev/null 2>&1; then
+    echo 'REMOTE_STATUS: START: BR-SRV: запускаю compose /opt/exam-app строго без pull из интернета'
+    $COMPOSE_CMD down >/tmp/br_srv_compose_down.log 2>&1 || true
+    if timeout 300 $COMPOSE_CMD up -d --pull never >/tmp/br_srv_compose_up.log 2>&1; then
+      echo 'REMOTE_STATUS: OK: BR-SRV: compose up выполнен через --pull never'
+    else
+      echo 'REMOTE_STATUS: WARN: BR-SRV: compose не поддержал --pull never или завершился ошибкой; пробую без pull-флага, но только потому что локальные images уже есть'
+      timeout 300 $COMPOSE_CMD up -d >/tmp/br_srv_compose_up.log 2>&1 || true
+      echo 'REMOTE_STATUS: OK: BR-SRV: compose up выполнен fallback'
+    fi
+  else
+    echo 'REMOTE_STATUS: WARN: BR-SRV: site:latest или mariadb:11 отсутствуют, compose НЕ запускаю, чтобы не было скачивания'
+  fi
+fi
+
+docker ps --format 'REMOTE_STATUS: DOCKER: {{.Names}} {{.Image}} {{.Status}} {{.Ports}}' 2>/dev/null || true
+
+for n in 1 2 3 4 5 6; do
+  if curl -s --max-time 10 http://127.0.0.1:8080 >/tmp/br_srv_app_check.html 2>/tmp/br_srv_app_check.err; then
+    echo 'REMOTE_STATUS: OK: BR-SRV: приложение отвечает на 127.0.0.1:8080'
+    break
+  fi
+  echo "REMOTE_STATUS: WAIT: BR-SRV: приложение ещё не ответило, попытка $n/6"
+  sleep 5
+done
+
+if ! curl -s --max-time 10 http://127.0.0.1:8080 >/tmp/br_srv_app_check.html 2>/tmp/br_srv_app_check.err; then
+  echo 'REMOTE_STATUS: WARN: BR-SRV: приложение не ответило на 127.0.0.1:8080'
+  echo 'REMOTE_STATUS: WARN: BR-SRV: смотри /tmp/br_srv_compose_up.log и docker compose logs'
+  (cd /opt/exam-app && ($COMPOSE_CMD logs --tail=80 2>/tmp/br_srv_compose_logs.err || true)) >/tmp/br_srv_compose_logs.log 2>&1 || true
+fi
+
+mkdir -p /opt/nextcloud/db /opt/nextcloud/html
+cat > /opt/nextcloud/docker-compose.yml <<'EOF'
+version: "3.8"
+services:
+  db:
+    image: mysql:8.0
+    container_name: nextcloud-db
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: P@ssw0rd
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: P@ssw0rd
+    volumes:
+      - /opt/nextcloud/db:/var/lib/mysql
+  app:
+    image: nextcloud:apache
+    container_name: nextcloud-app
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "127.0.0.1:8081:80"
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: P@ssw0rd
+    volumes:
+      - /opt/nextcloud/html:/var/www/html
+EOF
+docker-compose -f /opt/nextcloud/docker-compose.yml up -d >/dev/null 2>&1 || true
+mkdir -p /etc/nginx/ssl /etc/nginx/sites-available /etc/nginx/sites-enabled
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/nextcloud.key -out /etc/nginx/ssl/nextcloud.crt -subj "/C=RU/ST=Exam/L=Exam/O=sirius/OU=exam/CN=192.168.30.2" >/dev/null 2>&1
+cat > /etc/nginx/sites-available/nextcloud.conf <<'EOF'
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name _;
+    ssl_certificate /etc/nginx/ssl/nextcloud.crt;
+    ssl_certificate_key /etc/nginx/ssl/nextcloud.key;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/nextcloud.conf /etc/nginx/sites-enabled/nextcloud.conf
+ln -sf /etc/nginx/sites-available/nextcloud.conf /etc/nginx/conf.d/nextcloud.conf
+nginx -t >/tmp/nginx_nextcloud_test.err 2>&1
+systemctl enable --now nginx >/dev/null 2>&1
+systemctl restart nginx
+REMOTE
+}
+
+hq_cli_payload(){
+cat <<'REMOTE'
+set -euo pipefail
+
+remote_step(){ echo "REMOTE_STATUS: START: $1"; }
+remote_done(){ echo "REMOTE_STATUS: OK: $1"; }
+remote_skip(){ echo "REMOTE_STATUS: SKIP: $1"; }
+
+hostnamectl set-hostname hq-cli.sirius-exam.org || true
+echo "REMOTE_STATUS: START: HQ-CLI: проверяю пакеты, ничего не устанавливаю"
+CLI_MISSING=""
+for p in samba-client cifs-utils nfs-utils chrony curl bind-utils sudo; do
+  timeout 5 rpm -q "$p" >/dev/null 2>&1 || CLI_MISSING="$CLI_MISSING $p"
+done
+timeout 5 rpm -q yandex-browser-stable >/dev/null 2>&1 || echo "REMOTE_STATUS: WARN: HQ-CLI: yandex-browser-stable не найден, но установку не запускаю"
+if [ -n "$CLI_MISSING" ]; then
+  echo "REMOTE_STATUS: WARN: HQ-CLI: не найдены пакеты:$CLI_MISSING"
+  echo "REMOTE_STATUS: WARN: HQ-CLI: установка через dnf отключена, продолжаю"
+else
+  echo "REMOTE_STATUS: OK: HQ-CLI: основные пакеты уже установлены"
+fi
+groupadd hq 2>/dev/null || true
+for i in 1 2 3 4 5; do
+  useradd -m -G hq hquser$i 2>/dev/null || true
+  usermod -aG hq hquser$i
+  echo "hquser$i:P@ssw0rd" | chpasswd
+done
+mkdir -p /mnt/smb-hq
+mount -t cifs //192.168.30.2/hq /mnt/smb-hq -o username=hquser1,password='P@ssw0rd',vers=3.0 2>/dev/null || true
+touch /mnt/smb-hq/check_from_hqcli.txt 2>/dev/null || true
+mkdir -p /mnt/nfs
+grep -q '^192.168.100.2:/raid/nfs' /etc/fstab || echo '192.168.100.2:/raid/nfs /mnt/nfs nfs auto 0 0' >> /etc/fstab
+mount -av >/dev/null 2>&1 || true
+cat > /etc/chrony.conf <<'EOF'
+server 172.16.1.1 iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+EOF
+systemctl enable --now chronyd >/dev/null 2>&1
+systemctl restart chronyd
+groupadd Work 2>/dev/null || true
+groupadd Job 2>/dev/null || true
+groupadd labor 2>/dev/null || true
+useradd -m -G Work User1 2>/dev/null || true
+useradd -m -G Work User2 2>/dev/null || true
+useradd -m -G Job User3 2>/dev/null || true
+useradd -m -G Job User4 2>/dev/null || true
+useradd -m -G labor User5 2>/dev/null || true
+usermod -aG Work User1
+usermod -aG Work User2
+usermod -aG Job User3
+usermod -aG Job User4
+usermod -aG labor User5
+echo "User1:P@ssw0rd" | chpasswd
+echo "User2:P@ssw0rd" | chpasswd
+echo "User3:P@ssw0rd" | chpasswd
+echo "User4:P@ssw0rd" | chpasswd
+echo "User5:P@ssw0rd" | chpasswd
+mkdir -p /home/Folder/work_shared /home/Folder/job_readonly
+chown root:Work /home/Folder/work_shared
+chmod 770 /home/Folder/work_shared
+chown root:Job /home/Folder/job_readonly
+chmod 750 /home/Folder/job_readonly
+echo "SERVER1_IP=192.168.30.2" > /root/variant_server1_ip.txt
+sudo -u User1 touch /home/Folder/work_shared/user1_test.txt
+sudo -u User1 rm -f /home/Folder/work_shared/user1_test.txt
+sudo -u User3 ls -l /home/Folder/job_readonly/ >/dev/null 2>&1 || true
+sudo -u User3 touch /home/Folder/job_readonly/user3_test.txt >/dev/null 2>&1 && exit 2 || true
+sudo -u User5 ls -l /home/Folder/work_shared/ >/dev/null 2>&1 && exit 3 || true
+sudo -u User5 ls -l /home/Folder/job_readonly/ >/dev/null 2>&1 && exit 4 || true
+curl -k -I https://192.168.30.2 >/tmp/nextcloud_https_check.txt 2>&1 || true
+curl -k -I https://192.168.30.2 | grep -i Strict-Transport-Security >/tmp/hsts_check.txt 2>&1 || true
+REMOTE
+}
+
+ssh_run(){
+  local ip="$1" user="$2" pass="$3" name="$4" payload="$5" err="/tmp/demoexam_${name}.err" out="/tmp/demoexam_${name}_remote.log"
+  rm -f "$out" "$err"
+  echo "[..] $name: удалённое выполнение началось, подробный лог: $out"
+  sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 "$user@$ip" "bash -s" 2>"$err" <<< "$payload" | tee "$out" | sed -u -n 's/^REMOTE_STATUS: //p'
+  local rc=${PIPESTATUS[0]}
+  if [ "$rc" -eq 0 ]; then
+    echo "[OK] $name: удалённое выполнение завершено"
+  else
+    echo "[FAIL] $name: удалённое выполнение завершилось с ошибкой, код $rc"
+  fi
+  return "$rc"
+}
+
+check_ssh(){
+  local ip="$1" user="$2" pass="$3"
+  sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 "$user@$ip" "echo ok" >/dev/null 2>&1
+}
+
+
+remote_ssh_repair(){
+  local ip="$1" user="$2" pass="$3" name="$4"
+  local err="/tmp/demoexam_${name}_sshrepair.err"
+  local out="/tmp/demoexam_${name}_sshrepair.log"
+
+  echo "[..] $name: стабилизирую SSH на 22+2026 перед настройкой"
+  rm -f "$err" "$out"
+
+  sshpass -p "$pass" ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=10 \
+    "$user@$ip" "bash -s" 2>"$err" <<'REMOTE_SSH_REPAIR' | tee "$out" | sed -u -n 's/^REMOTE_STATUS: //p'
+set -u
+echo "REMOTE_STATUS: START: SSH repair: создаю host keys"
+mkdir -p /etc/ssh
+ssh-keygen -A >/dev/null 2>&1 || true
+
+echo "REMOTE_STATUS: START: SSH repair: пишу безопасный sshd_config"
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.autorepair.$(date +%H%M%S) 2>/dev/null || true
+
+cat > /etc/ssh/sshd_config <<'EOF'
+Port 22
+Port 2026
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UsePAM yes
+MaxAuthTries 2
+AllowUsers root sshuser
+X11Forwarding yes
+Subsystem sftp /usr/libexec/openssh/sftp-server
+EOF
+
+echo "REMOTE_STATUS: START: SSH repair: проверяю конфиг"
+sshd -t || exit 41
+
+echo "REMOTE_STATUS: START: SSH repair: открываю firewall/SELinux"
+if command -v semanage >/dev/null 2>&1; then
+  semanage port -a -t ssh_port_t -p tcp 2026 2>/dev/null || semanage port -m -t ssh_port_t -p tcp 2026 2>/dev/null || true
+fi
+firewall-cmd --permanent --add-port=22/tcp >/dev/null 2>&1 || true
+firewall-cmd --permanent --add-port=2026/tcp >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
+
+echo "REMOTE_STATUS: START: SSH repair: перезапускаю sshd"
+systemctl reset-failed sshd 2>/dev/null || true
+systemctl enable sshd >/dev/null 2>&1 || true
+systemctl restart sshd || exit 42
+
+echo "REMOTE_STATUS: OK: SSH repair: sshd запущен на 22 и 2026"
+REMOTE_SSH_REPAIR
+
+  local rc=${PIPESTATUS[0]}
+  sleep 3
+
+  if check_ssh "$ip" "$user" "$pass"; then
+    echo "[OK] $name: SSH после repair доступен"
+    return 0
+  fi
+
+  echo "[WARN] $name: после repair SSH не отвечает. Подробности:"
+  show_tail_err "$out"
+  show_tail_err "$err"
+  return "$rc"
+}
+
+configure_linux_device(){
+  local title="$1" name="$2" ip="$3" hint_func="$4" payload_func="$5"
+  echo "[..] $title: проверяю ping $ip"
+  get_root_ssh_pass_once
+
+  if ! check_ping "$ip"; then
+    echo "[WAIT] $title: ping нет"
+    "$hint_func"
+    wait_enter
+    check_ping "$ip" || { fail "$title не отвечает на ping"; return 1; }
+  fi
+  echo "[OK] $title ping есть"
+
+  echo "[..] $title: проверяю первичный SSH root@$ip:22"
+  if ! check_ssh "$ip" root "$ROOT_SSH_PASS"; then
+    echo "[WARN] $title: первичный SSH не прошёл."
+    echo "Проверь вручную с ISP:"
+    echo "  ssh root@$ip"
+    echo "Если вручную заходит — введи здесь тот же root-пароль."
+    [ -s /tmp/demoexam_check_ssh.err ] && { echo "Последняя SSH-ошибка:"; tail -n 5 /tmp/demoexam_check_ssh.err; }
+    ask_root_ssh_pass_force
+
+    if ! check_ssh "$ip" root "$ROOT_SSH_PASS"; then
+      echo "[WAIT] $title: SSH всё ещё недоступен. Нужно один раз включить SSH в консоли ВМ."
+      "$hint_func"
+      wait_enter
+      ask_root_ssh_pass_force
+      check_ssh "$ip" root "$ROOT_SSH_PASS" || { fail "$title недоступен по SSH"; return 1; }
+    fi
+  fi
+  echo "[OK] $title первичный SSH есть"
+
+  # Сразу после первого подключения чиним SSH на самой ВМ:
+  # оставляем root на 22 для управления и добавляем 2026 для задания.
+  if ! remote_ssh_repair "$ip" root "$ROOT_SSH_PASS" "$name"; then
+    fail "$title: не смог стабилизировать SSH"
+    return 1
+  fi
+
+  echo "[..] $title: отправляю команды настройки. Если долго — будут строки START/OK ниже"
+  local payload
+  payload=$("$payload_func")
+
+  if ssh_run "$ip" root "$ROOT_SSH_PASS" "$name" "$payload"; then
+    ok "$title настроен"
+    return 0
+  fi
+
+  echo "[WARN] $title: основная настройка оборвалась. Пробую восстановить SSH и повторить один раз."
+  remote_ssh_repair "$ip" root "$ROOT_SSH_PASS" "$name" || true
+  sleep 3
+
+  if ! check_ssh "$ip" root "$ROOT_SSH_PASS"; then
+    fail "$title: SSH не восстановился после обрыва"
+    show_tail_err "/tmp/demoexam_${name}_remote.log"
+    show_tail_err "/tmp/demoexam_${name}.err"
+    return 1
+  fi
+
+  echo "[..] $title: повторяю отправку команд настройки"
+  if ssh_run "$ip" root "$ROOT_SSH_PASS" "$name" "$payload"; then
+    ok "$title настроен после повторного подключения"
+    return 0
+  else
+    fail "$title не настроен"
+    show_tail_err "/tmp/demoexam_${name}_remote.log"
+    show_tail_err "/tmp/demoexam_${name}.err"
+    return 1
+  fi
+}
+
+
+repair_br_dnat(){
+  echo "[..] BR-RTR: перепрописываю DNAT 172.16.2.2:8080 -> 192.168.30.2:8080 и SSH 2026"
+  local ip="172.16.2.2" tmp="/tmp/demoexam_br_dnat_repair.expect" log="/tmp/demoexam_br_dnat_repair.log"
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/expect -f
+set timeout 120
+set ip "172.16.2.2"
+set user "net_admin"
+set pass "P@ssw0rd"
+log_user 1
+proc c {cmd} {
+    send_user -- "STEP CMD: $cmd\n"
+    send -- "$cmd\r"
+    expect {
+        -re {More\?.*} { send " "; exp_continue }
+        -re {[#>]} {}
+        timeout { send_user -- "ERROR TIMEOUT: $cmd\n"; exit 20 }
+        eof { send_user -- "ERROR EOF: $cmd\n"; exit 21 }
+    }
+}
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 $user@$ip
+expect {
+    -re "yes/no" { send "yes\r"; exp_continue }
+    -re "(P|p)assword:" { send "$pass\r" }
+    timeout { exit 10 }
+    eof { exit 11 }
+}
+expect -re {[#>]}
+c "configure terminal"
+c "interface __BRR_ISP_PORT__"
+c "ip firewall disable"
+c "ip address 172.16.2.2/28"
+c "ip nat proxy-arp PUBLIC_POOL"
+c "exit"
+c "interface __BRR_LAN_PORT__"
+c "ip firewall disable"
+c "ip address 192.168.30.1/28"
+c "exit"
+c "nat destination"
+c "pool BR_DOCKER"
+c "ip address 192.168.30.2"
+c "ip port 8080"
+c "exit"
+c "pool BR_SSH"
+c "ip address 192.168.30.2"
+c "ip port 2026"
+c "exit"
+c "ruleset DNAT"
+c "from default"
+c "rule 1"
+c "match protocol tcp"
+c "match destination-address prefix 172.16.2.2/32"
+c "match destination-port port-range 8080"
+c "action destination-nat pool BR_DOCKER"
+c "enable"
+c "exit"
+c "rule 2"
+c "match protocol tcp"
+c "match destination-address prefix 172.16.2.2/32"
+c "match destination-port port-range 2026"
+c "action destination-nat pool BR_SSH"
+c "enable"
+c "exit"
+c "exit"
+c "exit"
+c "nat source"
+c "pool TRANSLATE_ADDRESS"
+c "ip address-range 172.16.2.3-172.16.2.7"
+c "exit"
+c "ruleset SNAT"
+c "to interface __BRR_ISP_PORT__"
+c "rule 1"
+c "match source-address prefix 192.168.30.0/28"
+c "action source-nat pool TRANSLATE_ADDRESS"
+c "enable"
+c "exit"
+c "exit"
+c "exit"
+c "ip route 0.0.0.0/0 172.16.2.1"
+c "ip ssh server"
+c "do commit"
+c "do confirm"
+c "exit"
+expect {
+    -re {Do you still want to log out\?.*} { send "y\r"; exp_continue }
+    eof {}
+    timeout {}
+}
+EOF
+  chmod +x "$tmp"
+  sed -i \
+    -e "s#__BRR_ISP_PORT__#$BRR_ISP_PORT#g" \
+    -e "s#__BRR_LAN_PORT__#$BRR_LAN_PORT#g" "$tmp"
+  "$tmp" > "$log" 2>&1 || { echo "[WARN] BR-RTR: DNAT repair завершился с ошибкой, лог $log"; tail -40 "$log"; return 1; }
+  echo "[OK] BR-RTR: DNAT repair отправлен, лог $log"
+  sleep 3
+}
+
+
+preflight_resume_status(){
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "ПРЕДПРОВЕРКА / RESUME"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  check_ping 172.16.1.2 && echo "[READY] HQ-RTR ping 172.16.1.2" || echo "[MISS] HQ-RTR ping 172.16.1.2"
+  check_ping 172.16.2.2 && echo "[READY] BR-RTR ping 172.16.2.2" || echo "[MISS] BR-RTR ping 172.16.2.2"
+  check_ping 192.168.100.2 && echo "[READY] HQ-SRV ping 192.168.100.2" || echo "[MISS] HQ-SRV ping 192.168.100.2"
+  check_ping 192.168.30.2 && echo "[READY] BR-SRV ping 192.168.30.2" || echo "[MISS] BR-SRV ping 192.168.30.2"
+  check_ping 192.168.200.3 && echo "[READY] HQ-CLI ping 192.168.200.3" || echo "[MISS] HQ-CLI ping 192.168.200.3"
+  curl -s --max-time 5 http://192.168.30.2:8080 | grep -qiE 'студент|html|сайт' \
+    && echo "[READY] Docker direct http://192.168.30.2:8080" \
+    || echo "[MISS] Docker direct http://192.168.30.2:8080"
+  curl -s --max-time 5 http://172.16.2.2:8080 | grep -qiE 'студент|html|сайт' \
+    && echo "[READY] BR DNAT http://172.16.2.2:8080" \
+    || echo "[MISS] BR DNAT http://172.16.2.2:8080"
+  echo "Скрипт можно запускать повторно: готовые части будут перезаписаны тем же конфигом или проверены, недостающие — дочинены."
+  echo
+}
+
+final_checks(){
+  check_ping 172.16.1.2 && ok "HQ-RTR отвечает" || fail "HQ-RTR не отвечает"
+  check_ping 172.16.2.2 && ok "BR-RTR отвечает" || fail "BR-RTR не отвечает"
+  check_ping 192.168.100.2 && ok "HQ-SRV отвечает" || fail "HQ-SRV не отвечает"
+  check_ping 192.168.30.2 && ok "BR-SRV отвечает" || fail "BR-SRV не отвечает"
+  check_ping 192.168.200.3 && ok "HQ-CLI отвечает" || fail "HQ-CLI не отвечает"
+
+  echo "[..] Проверяю Docker-сайт напрямую на BR-SRV: http://192.168.30.2:8080"
+  if curl -s --max-time 8 http://192.168.30.2:8080 | grep -qiE 'студент|html|сайт'; then
+    ok "Docker-сайт напрямую 192.168.30.2:8080 доступен"
+  else
+    fail "Docker-сайт напрямую 192.168.30.2:8080 не проверен"
+    echo "Проверь на BR-SRV: docker ps -a ; cd /opt/exam-app ; docker compose logs --tail=80"
+  fi
+
+  echo "[..] Проверяю DNAT BR-RTR: http://172.16.2.2:8080"
+  if curl -s --max-time 8 http://172.16.2.2:8080 | grep -qiE 'студент|html|сайт'; then
+    ok "DNAT BR-RTR 172.16.2.2:8080 доступен"
+  else
+    echo "[WARN] DNAT 172.16.2.2:8080 не ответил, перепрописываю NAT на BR-RTR и повторяю"
+    repair_br_dnat || true
+    if curl -s --max-time 8 http://172.16.2.2:8080 | grep -qiE 'студент|html|сайт'; then
+      ok "DNAT BR-RTR 172.16.2.2:8080 доступен после repair"
+    else
+      fail "DNAT BR-RTR 172.16.2.2:8080 всё ещё не ответил"
+      echo "Ручная проверка: ssh net_admin@172.16.2.2 ; show running-config | смотреть nat destination"
+    fi
+  fi
+
+  curl -s --max-time 5 -u WEB:'P@ssw0rd' http://web.sirius-exam.org >/dev/null 2>&1 && ok "web.sirius-exam.org доступен" || fail "web.sirius-exam.org не проверен"
+  curl -k -s -I --max-time 5 https://192.168.30.2 | grep -qi Strict-Transport-Security && ok "HSTS Nextcloud есть" || fail "HSTS Nextcloud не проверен"
+}
+
+main(){
+  need_root
+  install_tools || exit 1
+  auto_from_bootstrap || exit 1
+  preflight_resume_status || true
+  say "Центральная пошаговая настройка + авто через nmcli/ip + show running-config + fix без default-expired + HQ-MGMT удалён + Eltex post-check warning only + NO_DNF_CHECK_ONLY + docker-tag-fix + BR-DNAT-repair + rerun-safe + payload-helper-fix + compose.zip + Additional.iso с видимым прогрессом. VESR: только commit + confirm, без save."
+  say "Дальше идём только после успешного шага. Ошибки: /tmp/demoexam_*.err"
+  run_until_ok "ШАГ 1/7 — ISP" configure_isp
+  run_until_ok "ШАГ 2/7 — HQ-RTR" configure_hq_rtr
+  run_until_ok "ШАГ 3/7 — BR-RTR" configure_br_rtr
+  run_until_ok "ШАГ 4/7 — HQ-SRV" "configure_linux_device HQ-SRV hq_srv 192.168.100.2 linux_hint_hq_srv hq_srv_payload"
+  run_until_ok "ШАГ 5/7 — BR-SRV" "configure_linux_device BR-SRV br_srv 192.168.30.2 linux_hint_br_srv br_srv_payload"
+  if curl -s --max-time 8 http://192.168.30.2:8080 | grep -qiE 'студент|html|сайт'; then
+    ok "BR-SRV Docker сайт отвечает напрямую"
+    curl -s --max-time 8 http://172.16.2.2:8080 | grep -qiE 'студент|html|сайт' || repair_br_dnat || true
+  else
+    echo "[WARN] BR-SRV Docker сайт напрямую пока не ответил, финальная проверка покажет детали"
+  fi
+  run_until_ok "ШАГ 6/7 — HQ-CLI" "configure_linux_device HQ-CLI hq_cli 192.168.200.3 linux_hint_hq_cli hq_cli_payload"
+  run_until_ok "ШАГ 7/7 — финальные проверки" final_checks
+  echo
+  echo "Готово. Статус: $STATUS_FILE"
+  cat "$STATUS_FILE"
+}
+
+main "$@"
