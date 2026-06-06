@@ -1,15 +1,79 @@
 #!/bin/bash
-# run on ISP (as root or user with SSH access to root@targets)
-# This script will connect to HQ-SRV, BR-SRV, HQ-CLI and inject the exam commands
-# into each machine's root history, so that `history` and arrow-up will show them.
+# ============================================================
+#  Run on ISP (as root)
+#  This script will:
+#  1. Clear and inject ISP’s own history (local, not via SSH)
+#  2. Connect to HQ-SRV, BR-SRV, HQ-CLI and do the same
+#  After execution, each machine will show the exam commands
+#  with `history` and arrow-up, without the clearing command.
+# ============================================================
 
 set -e
 
+# ---- utility: encode multiline text to base64 ----
 encode_block() {
     base64 -w0
 }
 
-# ---- HQ-SRV commands (exactly as they would appear in history) ----
+# ---- ISP commands (local machine) ----
+ISP_CMDS=$(cat <<'END_ISP' | encode_block
+nmcli con delete ISP-WAN 2>/dev/null || true
+nmcli con delete ISP-HQ 2>/dev/null || true
+nmcli con delete ISP-BR 2>/dev/null || true
+nmcli con add type ethernet ifname ens3 con-name ISP-WAN ipv4.method auto ipv6.method ignore
+nmcli con add type ethernet ifname ens4 con-name ISP-HQ ipv4.addresses 172.16.1.1/28 ipv4.method manual ipv6.method ignore
+nmcli con add type ethernet ifname ens5 con-name ISP-BR ipv4.addresses 172.16.2.1/28 ipv4.method manual ipv6.method ignore
+nmcli con up ISP-WAN
+nmcli con up ISP-HQ
+nmcli con up ISP-BR
+hostnamectl set-hostname isp.sirius-exam.org
+systemctl enable --now sshd
+systemctl restart sshd
+echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-ip-forward.conf
+sysctl --system
+ip route replace 192.168.100.0/27 via 172.16.1.2
+ip route replace 192.168.200.0/28 via 172.16.1.2
+ip route replace 192.168.30.0/28 via 172.16.2.2
+pkill -9 -f '/usr/bin/dnf' 2>/dev/null || true
+pkill -9 -f '/usr/bin/rpm' 2>/dev/null || true
+pkill -9 -f 'packagekitd' 2>/dev/null || true
+pkill -9 -f 'rpmdb' 2>/dev/null || true
+rm -f /var/cache/dnf/metadata_lock.pid /var/cache/dnf/download_lock.pid /var/lib/dnf/rpmdb_lock.pid /run/dnf.pid /var/run/dnf.pid
+dnf -v install -y --setopt=timeout=120 --setopt=retries=3 --setopt=minrate=1 nftables chrony nginx httpd-tools firewalld nano curl bind-utils openssh-clients expect sshpass
+mkdir -p /etc/nftables
+nano /etc/nftables/isp.nft
+grep -q '/etc/nftables/isp.nft' /etc/sysconfig/nftables.conf 2>/dev/null || echo 'include "/etc/nftables/isp.nft"' >> /etc/sysconfig/nftables.conf
+systemctl enable --now nftables
+systemctl restart nftables
+nano /etc/chrony.conf
+systemctl enable --now chronyd
+systemctl restart chronyd
+sed -i '/web\.sirius-exam\.org/d;/docker\.sirius-exam\.org/d' /etc/hosts
+echo '127.0.0.1 web.sirius-exam.org' >> /etc/hosts
+echo '127.0.0.1 docker.sirius-exam.org' >> /etc/hosts
+htpasswd -bc /etc/nginx/.htpasswd WEB 'P@ssw0rd'
+chmod 644 /etc/nginx/.htpasswd
+nano /etc/nginx/conf.d/demoexam_proxy.conf
+setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+firewall-cmd --permanent --add-service=http
+firewall-cmd --permanent --add-service=ssh
+firewall-cmd --reload
+nginx -t
+systemctl enable --now nginx
+systemctl restart nginx
+ip -br a
+ip route
+ping -c 3 172.16.1.2
+ping -c 3 172.16.2.2
+ping -c 3 192.168.100.2
+ping -c 3 192.168.30.2
+ping -c 3 192.168.200.3
+curl -s -u WEB:'P@ssw0rd' http://web.sirius-exam.org
+curl -s http://docker.sirius-exam.org
+END_ISP
+)
+
+# ---- HQ-SRV commands ----
 HQ_SRV_CMDS=$(cat <<'END_HQ' | encode_block
 nmcli con delete HQ-SRV 2>/dev/null || true
 nmcli con add type ethernet ifname ens3 con-name HQ-SRV ipv4.addresses 192.168.100.2/27 ipv4.gateway 192.168.100.1 ipv4.method manual ipv6.method ignore
@@ -237,7 +301,19 @@ curl -s http://192.168.30.2:8080
 END_CLI
 )
 
-# ---- apply to each target ----
+# ============================================================
+# 1. LOCAL: inject ISP history (machine where script is run)
+# ============================================================
+echo ">>> Setting history on ISP (local machine) ..."
+# The space at the beginning of the next line prevents it from being saved in history
+ echo "$ISP_CMDS" | base64 -d > /root/.bash_history
+  history -c 2>/dev/null
+ history -r 2>/dev/null
+echo "ISP history set."
+
+# ============================================================
+# 2. REMOTE: inject history on HQ-SRV, BR-SRV, HQ-CLI via SSH
+# ============================================================
 declare -A TARGETS
 TARGETS[192.168.100.2]=$HQ_SRV_CMDS
 TARGETS[192.168.30.2]=$BR_SRV_CMDS
@@ -245,7 +321,6 @@ TARGETS[192.168.200.3]=$HQ_CLI_CMDS
 
 for IP in "${!TARGETS[@]}"; do
     echo ">>> Setting history on $IP ..."
-    # Clear history file, write new commands, then clear in-memory history (ignorespace trick)
     ssh root@"$IP" "echo '${TARGETS[$IP]}' | base64 -d > /root/.bash_history;   history -c 2>/dev/null; history -r 2>/dev/null" || {
         echo "ERROR: Failed on $IP" >&2
         exit 1
@@ -253,4 +328,4 @@ for IP in "${!TARGETS[@]}"; do
     echo "Done for $IP"
 done
 
-echo "All history files have been set. Log in to each machine and use 'history' or arrow-up to see the commands."
+echo "All histories set. Connect to any machine and use 'history' or arrow-up."
