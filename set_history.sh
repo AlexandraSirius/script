@@ -8,8 +8,8 @@
 #  with `history` and arrow-up, without the clearing command.
 # ============================================================
 
-set -e
-# v2: ISP history first, then remote targets in fixed order; ping/SSH failures are skipped.
+set -u
+# v3: ISP history first, then remote targets in fixed order; ping/SSH failures are skipped.
 
 # ---- utility: encode multiline text to base64 ----
 encode_block() {
@@ -306,11 +306,15 @@ END_CLI
 # 1. LOCAL: inject ISP history (machine where script is run)
 # ============================================================
 echo ">>> Setting history on ISP (local machine) ..."
-# The space at the beginning of the next line prevents it from being saved in history
- echo "$ISP_CMDS" | base64 -d > /root/.bash_history
-  history -c 2>/dev/null
- history -r 2>/dev/null
-echo "ISP history set."
+# Do NOT use `history -c` in a non-interactive shell: it returns non-zero and can close SSH.
+if echo "$ISP_CMDS" | base64 -d > /root/.bash_history; then
+    chmod 600 /root/.bash_history 2>/dev/null || true
+    chown root:root /root/.bash_history 2>/dev/null || true
+    HISTFILE=/root/.bash_history history -r 2>/dev/null || true
+    echo "ISP history set."
+else
+    echo "WARN: failed to write ISP history, but continuing." >&2
+fi
 
 # ============================================================
 # 2. REMOTE: inject history on HQ-SRV, BR-SRV, HQ-CLI via SSH
@@ -333,7 +337,7 @@ inject_remote_history() {
 
     echo ">>> $NAME ($IP): ping OK, trying SSH ..."
 
-    if ! timeout 45 ssh         -o StrictHostKeyChecking=no         -o UserKnownHostsFile=/dev/null         -o GlobalKnownHostsFile=/dev/null         -o UpdateHostKeys=no         -o ConnectTimeout=8         root@"$IP"         "echo '$DATA' | base64 -d > /root/.bash_history; history -c 2>/dev/null; history -r 2>/dev/null"; then
+    if ! timeout 45 ssh         -o StrictHostKeyChecking=no         -o UserKnownHostsFile=/dev/null         -o GlobalKnownHostsFile=/dev/null         -o UpdateHostKeys=no         -o ConnectTimeout=8         root@"$IP"         "echo '$DATA' | base64 -d > /root/.bash_history; chmod 600 /root/.bash_history 2>/dev/null || true; chown root:root /root/.bash_history 2>/dev/null || true; true"; then
         echo "SKIP: $NAME ($IP) SSH failed or timed out. Going to next machine."
         return 0
     fi
