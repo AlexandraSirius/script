@@ -9,6 +9,7 @@
 # ============================================================
 
 set -e
+# v2: ISP history first, then remote targets in fixed order; ping/SSH failures are skipped.
 
 # ---- utility: encode multiline text to base64 ----
 encode_block() {
@@ -313,19 +314,37 @@ echo "ISP history set."
 
 # ============================================================
 # 2. REMOTE: inject history on HQ-SRV, BR-SRV, HQ-CLI via SSH
+#    ISP is always done first. Remote machines are processed
+#    one by one. If ping or SSH fails, skip and continue.
 # ============================================================
-declare -A TARGETS
-TARGETS[192.168.100.2]=$HQ_SRV_CMDS
-TARGETS[192.168.30.2]=$BR_SRV_CMDS
-TARGETS[192.168.200.3]=$HQ_CLI_CMDS
 
-for IP in "${!TARGETS[@]}"; do
-    echo ">>> Setting history on $IP ..."
-    ssh root@"$IP" "echo '${TARGETS[$IP]}' | base64 -d > /root/.bash_history;   history -c 2>/dev/null; history -r 2>/dev/null" || {
-        echo "ERROR: Failed on $IP" >&2
-        exit 1
-    }
-    echo "Done for $IP"
-done
+inject_remote_history() {
+    local NAME="$1"
+    local IP="$2"
+    local DATA="$3"
 
-echo "All histories set. Connect to any machine and use 'history' or arrow-up."
+    echo
+    echo ">>> $NAME ($IP): checking ping ..."
+
+    if ! ping -c 2 -W 2 "$IP" >/dev/null 2>&1; then
+        echo "SKIP: $NAME ($IP) is not reachable by ping. Going to next machine."
+        return 0
+    fi
+
+    echo ">>> $NAME ($IP): ping OK, trying SSH ..."
+
+    if ! timeout 45 ssh         -o StrictHostKeyChecking=no         -o UserKnownHostsFile=/dev/null         -o GlobalKnownHostsFile=/dev/null         -o UpdateHostKeys=no         -o ConnectTimeout=8         root@"$IP"         "echo '$DATA' | base64 -d > /root/.bash_history; history -c 2>/dev/null; history -r 2>/dev/null"; then
+        echo "SKIP: $NAME ($IP) SSH failed or timed out. Going to next machine."
+        return 0
+    fi
+
+    echo "OK: history set on $NAME ($IP)"
+}
+
+inject_remote_history "HQ-SRV" "192.168.100.2" "$HQ_SRV_CMDS"
+inject_remote_history "BR-SRV" "192.168.30.2" "$BR_SRV_CMDS"
+inject_remote_history "HQ-CLI" "192.168.200.3" "$HQ_CLI_CMDS"
+
+echo
+echo "Done. ISP history was set first. Remote unavailable machines were skipped."
+echo "Connect to any available machine and use 'history' or arrow-up."
